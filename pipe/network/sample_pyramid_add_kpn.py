@@ -1,63 +1,25 @@
 import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 
 sys.path.insert(0, './module/')
-import tensorflow as tf
 from dataset import *
-from activation import *
-from conv import conv
-from dfus_block import dfus_block_add_output_conv
-
-tf.logging.set_verbosity(tf.logging.INFO)
+from module.activation import *
+from module.conv import conv
+from module.dfus_block import dfus_block_add_output_conv
+from module.utils import bilinear_warp, costvolumelayer
 
 PI = 3.14159265358979323846
 flg = False
-dtype = tf.float32
+dtype = torch.float32
 
 
-def feature_extractor_subnet(x, flg, regular):
-    """Build a U-Net architecture"""
-
-    """ Args: x is the input, 4-D tensor (BxHxWxC)
-              flg represent weather add the BN
-              regular represent the regularizer number 
-
-
-        Return: output is 4-D Tensor (BxHxWxC)
-    """
-
-    pref = 'feature_extractor_subnet_'
-
-    # whether to train flag
-    train_ae = flg
-
-    # define initializer for the network
-    keys = ['conv', 'upsample']
-    keys_avoid = ['OptimizeLoss']
-    inits = []
-
-    init_net = None
-    if init_net != None:
-        for name in init_net.get_variable_names():
-            # select certain variables
-            flag_init = False
-            for key in keys:
-                if key in name:
-                    flag_init = True
-            for key in keys_avoid:
-                if key in name:
-                    flag_init = False
-            if flag_init:
-                name_f = name.replace('/', '_')
-                num = str(init_net.get_variable_value(name).tolist())
-                # self define the initializer function
-                from tensorflow.python.framework import dtypes
-                from tensorflow.python.ops.init_ops import Initializer
-                exec(
-                    "class " + name_f + "(Initializer):\n def __init__(self,dtype=tf.float32): self.dtype=dtype \n def __call__(self,shape,dtype=None,partition_info=None): return tf.cast(np.array(" + num + "),dtype=self.dtype)\n def get_config(self):return {\"dtype\": self.dtype.name}")
-                inits.append(name_f)
-
-    # autoencoder
-    n_filters = [
+class FeatureExtractorSubnet(nn.Module):
+    def __init__(self, flg=None, regular=None, batch_size=None, deformable_range=None):
+        super().__init__()
+        self.n_filters = [
         16, 16,
         32, 32,
         64, 64,
@@ -65,15 +27,8 @@ def feature_extractor_subnet(x, flg, regular):
         128, 128,
         192, 192,
     ]
-    filter_sizes = [
-        3, 3,
-        3, 3,
-        3, 3,
-        3, 3,
-        3, 3,
-        3, 3,
-    ]
-    pool_sizes = [ \
+        self.filter_sizes = [3] * len(self.n_filters)
+        self.pool_sizes = [
         1, 1,
         2, 1,
         2, 1,
@@ -81,7 +36,7 @@ def feature_extractor_subnet(x, flg, regular):
         2, 1,
         2, 1,
     ]
-    pool_strides = [
+        self.pool_strides = [
         1, 1,
         2, 1,
         2, 1,
@@ -89,7 +44,7 @@ def feature_extractor_subnet(x, flg, regular):
         2, 1,
         2, 1,
     ]
-    skips = [ \
+        self.skips = [
         False, False,
         True, False,
         True, False,
@@ -97,598 +52,208 @@ def feature_extractor_subnet(x, flg, regular):
         True, False,
         True, False,
     ]
-    # change space
-    ae_inputs = tf.identity(x, name='ae_inputs')
-
-    # prepare input
-    current_input = tf.identity(ae_inputs, name="input")
-    ####################################################################################################################
-    # convolutional layers: feature extractor
-    features = []
-    for i in range(0, len(n_filters)):
-        name = pref + "conv_" + str(i)
-
-        # define the initializer
-        if name + '_bias' in inits:
-            bias_init = eval(name + '_bias()')
-        else:
-            bias_init = tf.zeros_initializer()
-        if name + '_kernel' in inits:
-            kernel_init = eval(name + '_kernel()')
-        else:
-            kernel_init = None
-
-        # convolution
-        current_input = tf.layers.conv2d(
-            inputs=current_input,
-            filters=n_filters[i],
-            kernel_size=[filter_sizes[i], filter_sizes[i]],
-            padding="same",
-            activation=relu,
-            trainable=train_ae,
-            kernel_initializer=kernel_init,
-            bias_initializer=bias_init,
-            name=name,
-        )
-
-        if pool_sizes[i] == 1 and pool_strides[i] == 1:
-            current_input = current_input
-            if (i == len(n_filters) - 1) or (pool_sizes[i + 1] == 2 and pool_strides[i + 1] == 2):
-                features.append(current_input)
-        else:
-            current_input = tf.layers.max_pooling2d( \
-                inputs=current_input,
-                pool_size=[pool_sizes[i], pool_sizes[i]],
-                strides=pool_strides[i],
-                name=pref + "pool_" + str(i)
+        self.convs = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        in_channels = 2
+        for i in range(len(self.n_filters)):
+            self.convs.append(
+                nn.Conv2d(in_channels, self.n_filters[i], kernel_size=3, padding=1)
             )
-    return features
-
-
-def depth_residual_regresssion_subnet(x, flg, regular, subnet_num):
-    """Build a U-Net architecture"""
-    """ Args: x is the input, 4-D tensor (BxHxWxC)
-              flg represent weather add the BN
-              regular represent the regularizer number 
-
-
-        Return: output is 4-D Tensor (BxHxWxC)
-    """
-
-    pref = 'depth_regression_subnet_' + str(subnet_num) + '_'
-
-    # whether to train flag
-    train_ae = flg
-
-    # define initializer for the network
-    keys = ['conv', 'upsample']
-    keys_avoid = ['OptimizeLoss']
-    inits = []
-
-    init_net = None
-    if init_net != None:
-        for name in init_net.get_variable_names():
-            # select certain variables
-            flag_init = False
-            for key in keys:
-                if key in name:
-                    flag_init = True
-            for key in keys_avoid:
-                if key in name:
-                    flag_init = False
-            if flag_init:
-                name_f = name.replace('/', '_')
-                num = str(init_net.get_variable_value(name).tolist())
-                # self define the initializer function
-                from tensorflow.python.framework import dtypes
-                from tensorflow.python.ops.init_ops import Initializer
-                exec(
-                    "class " + name_f + "(Initializer):\n def __init__(self,dtype=tf.float32): self.dtype=dtype \n def __call__(self,shape,dtype=None,partition_info=None): return tf.cast(np.array(" + num + "),dtype=self.dtype)\n def get_config(self):return {\"dtype\": self.dtype.name}")
-                inits.append(name_f)
-
-    # autoencoder
-    n_filters = [
-        128, 96,
-        64, 32,
-        16, 1,
-    ]
-    filter_sizes = [
-        3, 3,
-        3, 3,
-        3, 3,
-    ]
-    pool_sizes = [ \
-        1, 1,
-        1, 1,
-        1, 1,
-    ]
-    pool_strides = [
-        1, 1,
-        1, 1,
-        1, 1,
-    ]
-    skips = [ \
-        False, False,
-        False, False,
-        False, False,
-    ]
-    # change space
-    ae_inputs = tf.identity(x, name='ae_inputs')
-
-    # prepare input
-    current_input = tf.identity(ae_inputs, name="input")
-    ####################################################################################################################
-    # convolutional layers: depth regression
-    feature = []
-    for i in range(0, len(n_filters)):
-        name = pref + "conv_" + str(i)
-
-        # define the initializer
-        if name + '_bias' in inits:
-            bias_init = eval(name + '_bias()')
-        else:
-            bias_init = tf.zeros_initializer()
-        if name + '_kernel' in inits:
-            kernel_init = eval(name + '_kernel()')
-        else:
-            kernel_init = None
-        if i == (len(n_filters) - 1):
-            activation = None
-        else:
-            activation = relu
-
-        # convolution
-        current_input = tf.layers.conv2d(
-            inputs=current_input,
-            filters=n_filters[i],
-            kernel_size=[filter_sizes[i], filter_sizes[i]],
-            padding="same",
-            activation=activation,
-            trainable=train_ae,
-            kernel_initializer=kernel_init,
-            bias_initializer=bias_init,
-            name=name,
-        )
-
-        if pool_sizes[i] == 1 and pool_strides[i] == 1:
-            feature.append(current_input)
-        else:
-            feature.append(
-                tf.layers.max_pooling2d( \
-                    inputs=current_input,
-                    pool_size=[pool_sizes[i], pool_sizes[i]],
-                    strides=pool_strides[i],
-                    name=pref + "pool_" + str(i)
+            in_channels = self.n_filters[i]
+            if self.pool_sizes[i] > 1:
+                self.pools.append(
+                    nn.MaxPool2d(kernel_size=self.pool_sizes[i], stride=self.pool_strides[i])
                 )
-            )
-        current_input = feature[-1]
+            else:
+                self.pools.append(None)
+        # 保留参数以兼容接口
+        self.flg = flg
+        self.regular = regular
+        self.batch_size = batch_size
+        self.deformable_range = deformable_range
 
-    depth_coarse = tf.identity(feature[-1], name='depth_coarse_output')
-    return depth_coarse
+    def forward(self, x):
+        features = []
+        current_input = x
+        for i in range(len(self.n_filters)):
+            current_input = self.convs[i](current_input)
+            current_input = F.relu(current_input)
+            if self.pool_sizes[i] == 1 and self.pool_strides[i] == 1:
+                if (i == len(self.n_filters) - 1) or (self.pool_sizes[i + 1] == 2 and self.pool_strides[i + 1] == 2):
+                    features.append(current_input)
+            else:
+                current_input = self.pools[i](current_input)
+        return features
 
-def unet_subnet(x, flg, regular):
-    """Build a U-Net architecture"""
+class DepthResidualRegressionSubnet(nn.Module):
+    def __init__(self, in_channels=None, flg=None, regular=None, batch_size=None, deformable_range=None):
+        super().__init__()
+        self.n_filters = [128, 96, 64, 32, 16, 1]
+        self.convs = nn.ModuleList()
 
-    """ Args: x is the input, 4-D tensor (BxHxWxC)
-              flg represent weather add the BN
-              regular represent the regularizer number 
-
-
-        Return: output is 4-D Tensor (BxHxWxC)
-    """
-
-    pref = 'unet_subnet_'
-
-    # whether to train flag
-    train_ae = flg
-
-    # define initializer for the network
-    keys = ['conv', 'upsample']
-    keys_avoid = ['OptimizeLoss']
-    inits = []
-
-    init_net = None
-    if init_net != None:
-        for name in init_net.get_variable_names():
-            # select certain variables
-            flag_init = False
-            for key in keys:
-                if key in name:
-                    flag_init = True
-            for key in keys_avoid:
-                if key in name:
-                    flag_init = False
-            if flag_init:
-                name_f = name.replace('/', '_')
-                num = str(init_net.get_variable_value(name).tolist())
-                # self define the initializer function
-                from tensorflow.python.framework import dtypes
-                from tensorflow.python.ops.init_ops import Initializer
-                exec(
-                    "class " + name_f + "(Initializer):\n def __init__(self,dtype=tf.float32): self.dtype=dtype \n def __call__(self,shape,dtype=None,partition_info=None): return tf.cast(np.array(" + num + "),dtype=self.dtype)\n def get_config(self):return {\"dtype\": self.dtype.name}")
-                inits.append(name_f)
-
-    # autoencoder
-    n_filters = [
-        16, 16,
-        32, 32,
-        64, 64,
-        128, 128,
-    ]
-    filter_sizes = [
-        3, 3,
-        3, 3,
-        3, 3,
-        3, 3,
-    ]
-    pool_sizes = [ \
-        1, 1,
-        2, 1,
-        2, 1,
-        2, 1,
-    ]
-    pool_strides = [
-        1, 1,
-        2, 1,
-        2, 1,
-        2, 1,
-    ]
-    skips = [ \
-        False, False,
-        True, False,
-        True, False,
-        True, False,
-    ]
-    # change space
-    ae_inputs = tf.identity(x, name='ae_inputs')
-
-    # prepare input
-    current_input = tf.identity(ae_inputs, name="input")
-    ####################################################################################################################
-    # convolutional layers: encoder
-    conv = []
-    pool = [current_input]
-    for i in range(0, len(n_filters)):
-        name = pref + "conv_" + str(i)
-
-        # define the initializer
-        if name + '_bias' in inits:
-            bias_init = eval(name + '_bias()')
-        else:
-            bias_init = tf.zeros_initializer()
-        if name + '_kernel' in inits:
-            kernel_init = eval(name + '_kernel()')
-        else:
-            kernel_init = None
-
-        # convolution
-        conv.append( \
-            tf.layers.conv2d( \
-                inputs=current_input,
-                filters=n_filters[i],
-                kernel_size=[filter_sizes[i], filter_sizes[i]],
-                padding="same",
-                activation=relu,
-                trainable=train_ae,
-                kernel_initializer=kernel_init,
-                bias_initializer=bias_init,
-                name=name,
-            )
-        )
-        if pool_sizes[i] == 1 and pool_strides[i] == 1:
-            pool.append(conv[-1])
-        else:
-            pool.append( \
-                tf.layers.max_pooling2d( \
-                    inputs=conv[-1],
-                    pool_size=[pool_sizes[i], pool_sizes[i]],
-                    strides=pool_strides[i],
-                    name=pref + "pool_" + str(i)
-                )
-            )
-        current_input = pool[-1]
-    ####################################################################################################################
-    # convolutional layer: decoder
-    # upsampling
-    upsamp = []
-    current_input = pool[-1]
-    for i in range((len(n_filters) - 1) - 1, 0, -1):
-        name = pref + "upsample_" + str(i)
-
-        # define the initializer
-        if name + '_bias' in inits:
-            bias_init = eval(name + '_bias()')
-        else:
-            bias_init = tf.zeros_initializer()
-        if name + '_kernel' in inits:
-            kernel_init = eval(name + '_kernel()')
-        else:
-            kernel_init = None
-        ## change the kernel size in upsample process
-        if skips[i] == False and skips[i + 1] == True:
-            filter_sizes[i] = 4
-        # upsampling
-        current_input = tf.layers.conv2d_transpose( \
-            inputs=current_input,
-            filters=n_filters[i],
-            kernel_size=[filter_sizes[i], filter_sizes[i]],
-            strides=(pool_strides[i], pool_strides[i]),
-            padding="same",
-            activation=relu,
-            trainable=train_ae,
-            kernel_initializer=kernel_init,
-            bias_initializer=bias_init,
-            name=name
-        )
-        upsamp.append(current_input)
-        # current_input = tf.layers.batch_normalization(
-        #     inputs=current_input,
-        #     training=train_ae,
-        #     name=pref + "upsamp_BN_" + str(i))
-        # skip connection
-        if skips[i] == False and skips[i - 1] == True:
-            current_input = tf.concat([current_input, pool[i + 1]], axis=-1)
-    ####################################################################################################################
-    features = tf.identity(upsamp[-1], name='ae_output')
-    return features
-
-def depth_output_subnet(inputs, flg, regular, kernel_size):  ## x (B,H,W,1), features:(B,H,W,64), samples:(B,H,W,9)
-    pref = 'depth_output_subnet_'
-
-    # whether to train flag
-    train_ae = flg
-    current_input = inputs
-    # define initializer for the network
-    keys = ['conv', 'upsample']
-    keys_avoid = ['OptimizeLoss']
-    inits = []
-
-    init_net = None
-    if init_net != None:
-        for name in init_net.get_variable_names():
-            # select certain variables
-            flag_init = False
-            for key in keys:
-                if key in name:
-                    flag_init = True
-            for key in keys_avoid:
-                if key in name:
-                    flag_init = False
-            if flag_init:
-                name_f = name.replace('/', '_')
-                num = str(init_net.get_variable_value(name).tolist())
-                # self define the initializer function
-                from tensorflow.python.framework import dtypes
-                from tensorflow.python.ops.init_ops import Initializer
-                exec(
-                    "class " + name_f + "(Initializer):\n def __init__(self,dtype=tf.float32): self.dtype=dtype \n def __call__(self,shape,dtype=None,partition_info=None): return tf.cast(np.array(" + num + "),dtype=self.dtype)\n def get_config(self):return {\"dtype\": self.dtype.name}")
-                inits.append(name_f)
-
-    n_filters_mix = [kernel_size ** 2]
-    filter_sizes_mix = [1]
-    mix = []
-    for i in range(len(n_filters_mix)):
-        name = pref + "conv_" + str(i)
-
-        # define the initializer
-        if name + '_bias' in inits:
-            bias_init = eval(name + '_bias()')
-        else:
-            bias_init = tf.zeros_initializer()
-        if name + '_kernel' in inits:
-            kernel_init = eval(name + '_kernel()')
-        else:
-            kernel_init = None
-
-        if i == (len(n_filters_mix) - 1):
-            activation = sigmoid
-        else:
-            activation = relu
-
-        # convolution
-        mix.append( \
-            tf.layers.conv2d( \
-                inputs=current_input,
-                filters=n_filters_mix[i],
-                kernel_size=[filter_sizes_mix[i], filter_sizes_mix[i]],
-                padding="same",
-                activation=activation,
-                trainable=train_ae,
-                kernel_initializer=kernel_init,
-                bias_initializer=bias_init,
-                name=name,
-            )
-        )
-        current_input = mix[-1]
-
-    # biases = current_input[:, :, :, 0::0 - kernel_size ** 2]
-    # weights = current_input[:, :, :, 0 - kernel_size ** 2::]
-    ## run y = w(x + b)
-
-    return current_input
-
-def dear_kpn(x, flg, regular):
-
-    kernel_size = 3
-    features = unet_subnet(x, flg, regular)
-    weights = depth_output_subnet(features, flg, regular, kernel_size=kernel_size)
-    weights = weights / tf.reduce_sum(tf.abs(weights) + 1e-6, axis=-1, keep_dims=True)
-    column = im2col(x, kernel_size=kernel_size)
-    current_output = tf.reduce_sum(column * weights, axis=-1, keep_dims=True)
-    depth_output = tf.identity(current_output, name='depth_output')
-
-    return depth_output
-
-def residual_output_subnet(x, flg, regular, subnet_num):
-    """Build a U-Net architecture"""
-    """ Args: x is the input, 4-D tensor (BxHxWxC)
-              flg represent weather add the BN
-              regular represent the regularizer number 
-
-
-        Return: output is 4-D Tensor (BxHxWxC)
-    """
-
-    pref = 'residual_output_subnet_' + str(subnet_num) + '_'
-
-    # whether to train flag
-    train_ae = flg
-
-    # define initializer for the network
-    keys = ['conv', 'upsample']
-    keys_avoid = ['OptimizeLoss']
-    inits = []
-
-    init_net = None
-    if init_net != None:
-        for name in init_net.get_variable_names():
-            # select certain variables
-            flag_init = False
-            for key in keys:
-                if key in name:
-                    flag_init = True
-            for key in keys_avoid:
-                if key in name:
-                    flag_init = False
-            if flag_init:
-                name_f = name.replace('/', '_')
-                num = str(init_net.get_variable_value(name).tolist())
-                # self define the initializer function
-                from tensorflow.python.framework import dtypes
-                from tensorflow.python.ops.init_ops import Initializer
-                exec(
-                    "class " + name_f + "(Initializer):\n def __init__(self,dtype=tf.float32): self.dtype=dtype \n def __call__(self,shape,dtype=None,partition_info=None): return tf.cast(np.array(" + num + "),dtype=self.dtype)\n def get_config(self):return {\"dtype\": self.dtype.name}")
-                inits.append(name_f)
-
-    # autoencoder
-    n_filters = [
-        1
-    ]
-    filter_sizes = [
-        1
-    ]
-    pool_sizes = [ \
-        1
-    ]
-    pool_strides = [
-        1
-    ]
-    skips = [ \
-        False
-    ]
-    # change space
-    ae_inputs = tf.identity(x, name='ae_inputs')
-
-    # prepare input
-    current_input = tf.identity(ae_inputs, name="input")
-    ####################################################################################################################
-    # convolutional layers: depth regression
-    feature = []
-    for i in range(0, len(n_filters)):
-        name = pref + "conv_" + str(i)
-
-        # define the initializer
-        if name + '_bias' in inits:
-            bias_init = eval(name + '_bias()')
-        else:
-            bias_init = tf.zeros_initializer()
-        if name + '_kernel' in inits:
-            kernel_init = eval(name + '_kernel()')
-        else:
-            kernel_init = None
-        if i == (len(n_filters) - 1):
-            activation = None
-        else:
-            activation = relu
-
-        # convolution
-        current_input = tf.layers.conv2d(
-            inputs=current_input,
-            filters=n_filters[i],
-            kernel_size=[filter_sizes[i], filter_sizes[i]],
-            padding="same",
-            activation=activation,
-            trainable=train_ae,
-            kernel_initializer=kernel_init,
-            bias_initializer=bias_init,
-            name=name,
+        # 第一层使用 LazyConv2d，自动适配输入通道数
+        self.convs.append(
+            nn.LazyConv2d(self.n_filters[0], kernel_size=3, padding=1)
         )
 
-        if pool_sizes[i] == 1 and pool_strides[i] == 1:
-            feature.append(current_input)
-        else:
-            feature.append(
-                tf.layers.max_pooling2d( \
-                    inputs=current_input,
-                    pool_size=[pool_sizes[i], pool_sizes[i]],
-                    strides=pool_strides[i],
-                    name=pref + "pool_" + str(i)
-                )
+        # 其余层使用标准 Conv2d
+        for i in range(1, len(self.n_filters)):
+            self.convs.append(
+                nn.Conv2d(self.n_filters[i - 1], self.n_filters[i], kernel_size=3, padding=1)
             )
-        current_input = feature[-1]
 
-    depth_residual_coarse = tf.identity(feature[-1], name='depth_coarse_residual_output')
-    return depth_residual_coarse
+        # 保留参数以兼容接口
+        self.flg = flg
+        self.regular = regular
+        self.batch_size = batch_size
+        self.deformable_range = deformable_range
 
-def sample_pyramid_add_kpn(x, flg, regular, batch_size, deformable_range):
+    def forward(self, x):
+        current_input = x
+        for i, conv in enumerate(self.convs):
+            current_input = conv(current_input)
+            if i != len(self.convs) - 1:
+                current_input = F.relu(current_input)
+        return current_input
 
-    depth_residual = []
-    depth_residual_input = []
-    depth_refine = []
-    offsets_scale = []
-    depth_residual_weight = [0.32, 0.08, 0.02, 0.01, 0.005]
-    h_max = tf.shape(x)[1]
-    w_max = tf.shape(x)[2]
+class ResidualOutputSubnet(nn.Module):
+    def __init__(self, in_channels, flg=None, regular=None, batch_size=None, deformable_range=None):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+        # 保留参数以兼容接口
+        self.flg = flg
+        self.regular = regular
+        self.batch_size = batch_size
+        self.deformable_range = deformable_range
 
-    # TFT3D dataset
-    # depth = tf.expand_dims(x[:, :, :, 0], axis=-1)
-    # amplitude = tf.expand_dims(x[:, :, :, 1], axis=-1)
-    # depth_2 = tf.expand_dims(x[:, :, :, 2], axis=-1)
-    # amplitude_2 = tf.expand_dims(x[:, :, :, 3], axis=-1)
-    # x1_input = tf.concat([depth, amplitude], axis=-1)
-    # x2_input = tf.concat([depth_2, amplitude_2], axis=-1)
-    # features = feature_extractor_subnet(x1_input, flg, regular)
+    def forward(self, x):
+        return self.conv(x)
 
-    # CornellBox dataset
-    # depth = tf.expand_dims(x[:, :, :, 0], axis=-1)
-    # frame_1 = x[:, :, :, :5]
-    # frame_2 = x[:, :, :, 5:]
-    # features = feature_extractor_subnet(frame_1, flg, regular)
 
-    # HAMMER dataset
-    depth = tf.expand_dims(x[:, :, :, 0], axis=-1)
-    amplitude = tf.expand_dims(x[:, :, :, 1], axis=-1)
-    # depth_2 = tf.expand_dims(x[:, :, :, 2], axis=-1)
-    # amplitude_2 = tf.expand_dims(x[:, :, :, 3], axis=-1)
-    x1_input = tf.concat([depth, amplitude], axis=-1)
-    # x2_input = tf.concat([depth_2, amplitude_2], axis=-1)
-    features = feature_extractor_subnet(x1_input, flg, regular)
+class UNetSubnet(nn.Module):
+    def __init__(self, flg=None, regular=None, batch_size=None, deformable_range=None):
+        super().__init__()
+        self.n_filters = [16, 16, 32, 32, 64, 64, 128, 128]
+        self.filter_sizes = [3] * len(self.n_filters)
+        self.pool_sizes = [1, 1, 2, 1, 2, 1, 2, 1]
+        self.pool_strides = [1, 1, 2, 1, 2, 1, 2, 1]
+        self.skips = [False, False, True, False, True, False, True, False]
+        self.encoder_convs = nn.ModuleList()
+        in_channels = 1
+        for i in range(len(self.n_filters)):
+            self.encoder_convs.append(
+                nn.Conv2d(in_channels, self.n_filters[i], kernel_size=3, padding=1)
+            )
+            in_channels = self.n_filters[i]
+        # Decoder
+        self.decoder_convs = nn.ModuleList()
+        for i in range(len(self.n_filters) - 2, 0, -1):
+            self.decoder_convs.append(
+                nn.ConvTranspose2d(self.n_filters[i], self.n_filters[i-1], kernel_size=3, stride=self.pool_strides[i], padding=1, output_padding=self.pool_strides[i]-1)
+            )
+        # 保留参数以兼容接口
+        self.flg = flg
+        self.regular = regular
+        self.batch_size = batch_size
+        self.deformable_range = deformable_range
 
-    for i in range(1, len(features) + 1):
+    def forward(self, x):
+        convs = []
+        pools = [x]
+        current_input = x
+        for i in range(len(self.n_filters)):
+            current_input = self.encoder_convs[i](current_input)
+            current_input = F.relu(current_input)
+            if self.pool_sizes[i] > 1:
+                current_input = F.max_pool2d(current_input, kernel_size=self.pool_sizes[i], stride=self.pool_strides[i])
+            convs.append(current_input)
+            pools.append(current_input)
+        current_input = pools[-1]
+        for i, deconv in enumerate(self.decoder_convs):
+            current_input = deconv(current_input)
+            current_input = F.relu(current_input)
+            if self.skips[i] and self.skips[i-1]:
+                current_input = torch.cat([current_input, pools[i+1]], dim=1)
+        return current_input
 
-        if i == 1:
-            inputs = features[len(features) - i]
-        else:
-            feature_input = features[len(features) - i]
-            h_max_low_scale = tf.shape(feature_input)[1]
-            w_max_low_scale = tf.shape(feature_input)[2]
-            depth_coarse_input = tf.image.resize_bicubic(depth_residual[-1], size=(h_max_low_scale, w_max_low_scale),
-                                                         align_corners=True)
-            true_depth_coarse_input = tf.image.resize_bicubic(depth, size=(h_max_low_scale, w_max_low_scale),
-                                                         align_corners=True)
-            inputs = tf.concat([feature_input, true_depth_coarse_input + depth_coarse_input], axis=-1)
-        current_depth_residual = depth_residual_regresssion_subnet(inputs, flg, regular, subnet_num=i)
-        depth_residual.append(current_depth_residual)
 
-        current_depth_residual_input = tf.image.resize_bicubic(current_depth_residual, size=(h_max, w_max),
-                                                               align_corners=True)
-        depth_residual_input.append(current_depth_residual_input)
+class DepthOutputSubnet(nn.Module):
+    def __init__(self, in_channels, kernel_size, flg=None, regular=None, batch_size=None, deformable_range=None):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, kernel_size**2, kernel_size=1)
+        # 保留参数以兼容接口
+        self.flg = flg
+        self.regular = regular
+        self.batch_size = batch_size
+        self.deformable_range = deformable_range
 
-    depth_coarse_residual_input = tf.concat(depth_residual_input, axis=-1)
-    final_depth_residual_output = residual_output_subnet(depth_coarse_residual_input, flg, regular, subnet_num=0)
+    def forward(self, x):
+        return torch.sigmoid(self.conv(x))
 
-    current_final_depth_output = depth + final_depth_residual_output
-    final_depth_output = dear_kpn(current_final_depth_output, flg, regular)
-    depth_residual_input.append(final_depth_residual_output)
-    depth_residual_input.append(final_depth_output - current_final_depth_output)
-    return final_depth_output, tf.concat(depth_residual_input, axis=-1)
+
+class DearKPN(nn.Module):
+    def __init__(self, kernel_size=3, flg=None, regular=None, batch_size=None, deformable_range=None):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.unet = UNetSubnet(flg, regular, batch_size, deformable_range)
+        self.depth_output = DepthOutputSubnet(16, kernel_size, flg, regular, batch_size, deformable_range)
+        # 保留参数以兼容接口
+        self.flg = flg
+        self.regular = regular
+        self.batch_size = batch_size
+        self.deformable_range = deformable_range
+
+    def forward(self, x):
+        features = self.unet(x)
+        weights = self.depth_output(features)
+        weights = weights / (torch.sum(torch.abs(weights) + 1e-6, dim=1, keepdim=True))
+        column = im2col(x, kernel_size=self.kernel_size)
+        current_output = torch.sum(column * weights, dim=1, keepdim=True)
+        return current_output
+
+
+class SamplePyramidAddKPN(nn.Module):
+    def __init__(self, batch_size, deformable_range, flg=None, regular=None):
+        super().__init__()
+        self.batch_size = batch_size
+        self.deformable_range = deformable_range
+        self.depth_residual_weight = [0.32, 0.08, 0.02, 0.01, 0.005]
+        self.feature_extractor = FeatureExtractorSubnet(flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range)
+        self.depth_residual_regressors = nn.ModuleList([
+            DepthResidualRegressionSubnet(in_channels=None, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range) for _ in range(6)
+        ])
+        self.residual_output = ResidualOutputSubnet(6, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range)
+        self.dear_kpn = DearKPN(kernel_size=3, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range)
+        # 保留参数以兼容接口
+        self.flg = flg
+        self.regular = regular
+
+    def forward(self, x):
+        depth_residual = []
+        depth_residual_input = []
+        # 假设输入 x 形状为 (B, C, H, W)
+        depth = x[:, 0:1, :, :]
+        amplitude = x[:, 1:2, :, :]
+        x1_input = torch.cat([depth, amplitude], dim=1)
+        features = self.feature_extractor(x1_input)  
+        h_max, w_max = x.shape[2], x.shape[3]
+        for i in range(1, len(features) + 1):
+            if i == 1:
+                inputs = features[len(features) - i]
+            else:
+                feature_input = features[len(features) - i]
+                h_max_low_scale, w_max_low_scale = feature_input.shape[2], feature_input.shape[3]
+                depth_coarse_input = F.interpolate(depth_residual[-1], size=(h_max_low_scale, w_max_low_scale), mode='bicubic', align_corners=True)
+                true_depth_coarse_input = F.interpolate(depth, size=(h_max_low_scale, w_max_low_scale), mode='bicubic', align_corners=True)
+                inputs = torch.cat([feature_input, true_depth_coarse_input + depth_coarse_input], dim=1)
+            current_depth_residual = self.depth_residual_regressors[i-1](inputs)
+            depth_residual.append(current_depth_residual)
+            current_depth_residual_input = F.interpolate(current_depth_residual, size=(h_max, w_max), mode='bicubic', align_corners=True)
+            depth_residual_input.append(current_depth_residual_input)
+        depth_coarse_residual_input = torch.cat(depth_residual_input, dim=1)
+        final_depth_residual_output = self.residual_output(depth_coarse_residual_input)
+        current_final_depth_output = depth + final_depth_residual_output
+        final_depth_output = self.dear_kpn(current_final_depth_output)
+        depth_residual_input.append(final_depth_residual_output)
+        depth_residual_input.append(final_depth_output - current_final_depth_output)
+        return final_depth_output, torch.cat(depth_residual_input, dim=1)

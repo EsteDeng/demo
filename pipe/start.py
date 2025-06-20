@@ -6,59 +6,55 @@
 # all time unit are picoseconds (1 picosec = 1e-12 sec)
 import sys
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"]="0,1,2,3"
-sys.path.insert(0, '../sim/')
 import argparse
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
 from PIL import Image
+import numpy as np
+from tqdm import tqdm
+# 获取 pipe 目录的绝对路径
+pipe_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
-
-tf.logging.set_verbosity(tf.logging.INFO)
+# 将 pipe 目录加入 sys.path，这样 pipe 下的模块都能直接导入
+if pipe_dir not in sys.path:
+    sys.path.insert(0, pipe_dir)
 from loss import *
 from model import *
-from kinect_pipeline import *
 from dataset import *
 from metric import *
 
-# tof_cam = kinect_real_tf()
+def stats_graph(model):
+    """Calculate trainable parameters of the model"""
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Trainable params: {total_params}')
 
-def stats_graph(graph):
-    flops = tf.profiler.profile(graph, options=tf.profiler.ProfileOptionBuilder.float_operation())
-    params = tf.profiler.profile(graph, options=tf.profiler.ProfileOptionBuilder.trainable_variables_parameter())
-    print('FLOPs: {};    Trainable params: {}'.format(flops.total_float_ops, params.total_parameters))
-
-def tof_net_func(features, labels, mode, params):
-    """
-    This is the network function of tensorflow estimator API
-    :param features:
-    :param labels:
-    :param mode:
-    :param params:
-    :return:
-    """
+def process_inputs(features, labels, params, mode, device):
+    """Helper function to process inputs and masks, similar to original tof_net_func's input part"""
     depth_kinect = None
-    depth_kinect_msk = None
     amplitude_kinect = None
     rgb_kinect = None
-    raw_new = None
-    depth_residual_every_scale = None
     gt_msk = None
     loss_mask_dict = {}
 
-    if params['training_set'] == 'tof_FT3':
-        if params['output_flg'] == True:
-            gt = None
-            gt_msk = features['noisy'] > 10.0/4095.0
-            gt_msk = tf.cast(gt_msk, tf.float32)
+    # Move all features and labels to the device
+    for key in features:
+        features[key] = features[key].to(device)
+    for key in labels:
+        if labels[key] is not None:
+            labels[key] = labels[key].to(device)
 
-            ### add gt msk
+
+    if params['training_set'] == 'tof_FT3':
+        if params['output_flg']:
+            gt = None # Only needed for loss/metrics, not for output mode
+            gt_msk = (features['noisy'] > 10.0).float()
             loss_mask_dict['gt_msk'] = gt_msk
         else:
             gt = labels['gt']
-            gt_msk = gt > 1e-4
-            gt_msk = tf.cast(gt_msk, tf.float32)
-
-            ### add gt msk
+            gt_msk = (gt > 1e-4).float()
             loss_mask_dict['gt_msk'] = gt_msk
         full = features['noisy']
         intensity = features['intensity']
@@ -67,23 +63,16 @@ def tof_net_func(features, labels, mode, params):
         depth_kinect = full
         amplitude_kinect = intensity
         rgb_kinect = rgb
-        depth_kinect_msk = depth_kinect < 1.0
-        depth_kinect_msk_tmp = depth_kinect > 10.0/4095.0
-        depth_kinect_msk = tf.cast(depth_kinect_msk, tf.float32)
-        depth_kinect_msk_tmp = tf.cast(depth_kinect_msk_tmp, tf.float32)
-        depth_kinect_msk = depth_kinect_msk * depth_kinect_msk_tmp
+        depth_kinect_msk = ((depth_kinect > 10) & (depth_kinect < 4095)).float()
 
     elif params['training_set'] == 'TB':
-        if params['output_flg'] == True:
+        if params['output_flg']:
             gt = None
             gt_msk = None
             loss_mask_dict['gt_msk'] = gt_msk
         else:
             gt = labels['gt']
-            gt_msk = gt > 1e-4
-            gt_msk = tf.cast(gt_msk, tf.float32)
-
-            ### add gt msk
+            gt_msk = (gt > 1e-4).float()
             loss_mask_dict['gt_msk'] = gt_msk
         full = features['noisy']
         intensity = features['intensity']
@@ -92,21 +81,16 @@ def tof_net_func(features, labels, mode, params):
         depth_kinect = full
         amplitude_kinect = intensity
         rgb_kinect = rgb
-        depth_kinect_msk = depth_kinect < 2.0
-        depth_kinect_msk_tmp = depth_kinect > 1e-4
-        depth_kinect_msk = tf.cast(depth_kinect_msk, tf.float32)
-        depth_kinect_msk_tmp = tf.cast(depth_kinect_msk_tmp, tf.float32)
+        depth_kinect_msk = (depth_kinect < 2.0).float()
+        depth_kinect_msk_tmp = (depth_kinect > 1e-4).float()
         depth_kinect_msk = depth_kinect_msk * depth_kinect_msk_tmp
 
     elif params['training_set'] == 'RGBDD':
-        if params['output_flg'] == True:
+        if params['output_flg']:
             gt = None
         else:
             gt = labels['gt']
-            gt_msk = gt > 1e-4
-            gt_msk = tf.cast(gt_msk, tf.float32)
-
-            ### add gt msk
+            gt_msk = (gt > 1e-4).float()
             loss_mask_dict['gt_msk'] = gt_msk
         full = features['noisy']
         intensity = features['intensity']
@@ -115,21 +99,16 @@ def tof_net_func(features, labels, mode, params):
         depth_kinect = full
         amplitude_kinect = intensity
         rgb_kinect = rgb
-        depth_kinect_msk = depth_kinect < 1.0
-        depth_kinect_msk_tmp = depth_kinect > 10.0/4095.0
-        depth_kinect_msk = tf.cast(depth_kinect_msk, tf.float32)
-        depth_kinect_msk_tmp = tf.cast(depth_kinect_msk_tmp, tf.float32)
+        depth_kinect_msk = (depth_kinect < 1.0).float()
+        depth_kinect_msk_tmp = (depth_kinect > 10.0/4095.0).float()
         depth_kinect_msk = depth_kinect_msk * depth_kinect_msk_tmp
 
     elif params['training_set'] == 'cornellbox':
-        if params['output_flg'] == True:
+        if params['output_flg']:
             gt = None
         else:
             gt = labels['gt']
-            gt_msk = gt_msk = tf.cast(gt < 1e3, tf.float32) * tf.cast(gt > 0.0000001, tf.float32)
-            # gt_msk = tf.cast(gt_msk, tf.float32)
-
-            ### add gt msk
+            gt_msk = ((gt < 1e3).float() * (gt > 0.0000001).float())
             loss_mask_dict['gt_msk'] = gt_msk
         full = features['noisy']
         amplitude = features['amplitude']
@@ -137,17 +116,13 @@ def tof_net_func(features, labels, mode, params):
         depth_kinect = full
         amplitude_kinect = amplitude
         depth_kinect_msk = gt_msk
-        # depth_kinect_msk = tf.cast(depth_kinect_msk, tf.float32)
 
     elif params['training_set'] == 'FLAT':
-        if params['output_flg'] == True:
+        if params['output_flg']:
             gt = None
         else:
             gt = labels['gt']
-            # gt_msk = (gt < 1e3) * (gt != 0)
-            gt_msk = tf.cast(gt < 1e3, tf.float32) * tf.cast(gt > 0.00001, tf.float32)
-
-            ### add gt msk
+            gt_msk = ((gt < 1e3).float() * (gt > 0.00001).float())
             loss_mask_dict['gt_msk'] = gt_msk
         full = features['noisy']
         amplitude = features['amplitude']
@@ -155,399 +130,524 @@ def tof_net_func(features, labels, mode, params):
         depth_kinect = full
         amplitude_kinect = amplitude
         depth_kinect_msk = gt_msk
-        # depth_kinect_msk = tf.cast(depth_kinect_msk, tf.float32)
 
     elif params['training_set'] == 'Agresti_S1':
-        if params['output_flg'] == True:
+        if params['output_flg']:
             gt = None
         else:
             gt = labels['gt']
-            # gt_msk = tf.cast(gt != 0, tf.float32)
-            gt_msk = tf.cast(gt < 1e3, tf.float32) * tf.cast(gt > 0.0000001, tf.float32)
-            # gt_msk = tf.cast(gt_msk, tf.float32)
-
-            ### add gt msk
+            gt_msk = ((gt < 1e3).float() * (gt > 0.0000001).float())
             loss_mask_dict['gt_msk'] = gt_msk
         full = features['noisy']
         amplitude = features['amplitude']
         depth_kinect = full
         amplitude_kinect = amplitude
         depth_kinect_msk = gt_msk
-        # depth_kinect_msk = depth_kinect > 1e-4
-        # depth_kinect_msk = tf.cast(depth_kinect_msk, tf.float32)
+    else:
+        gt = labels['gt'] if not params['output_flg'] else None
+        depth_kinect = features['noisy']
+        amplitude_kinect = features.get('amplitude', None) # Safely get amplitude
+        rgb_kinect = features.get('rgb', None) # Safely get rgb
+        depth_kinect_msk = None # Default if not explicitly set above
 
-    ### add kinect_msk
+    # Handle mask dependencies
     loss_mask_dict['depth_kinect_msk'] = depth_kinect_msk
-    if gt_msk != None:
-        # loss_mask_dict['gt_msk'] = gt_msk * depth_kinect_msk
+    if gt_msk is not None:
         loss_mask_dict['depth_kinect_with_gt_msk'] = gt_msk * depth_kinect_msk
         loss_mask_dict['gt_msk'] = gt_msk
     else:
         loss_mask_dict['depth_kinect_with_gt_msk'] = depth_kinect_msk
 
-    model_name_list = params['model_name'].split('_')
-
+    # Prepare inputs for the network
     if params['training_set'] == 'tof_FT3':
-        inputs = tf.concat([depth_kinect, amplitude_kinect, rgb_kinect], axis=-1)
+        inputs = torch.cat([depth_kinect, amplitude_kinect, rgb_kinect], dim=1)
     elif params['training_set'] == 'TB':
-        inputs = tf.concat([depth_kinect, amplitude_kinect, rgb_kinect], axis=-1)
+        inputs = torch.cat([depth_kinect, amplitude_kinect, rgb_kinect], dim=1)
     elif params['training_set'] == 'RGBDD':
-        inputs = tf.concat([depth_kinect, amplitude_kinect, rgb_kinect], axis=-1)
+        inputs = torch.cat([depth_kinect, amplitude_kinect, rgb_kinect], dim=1)
     elif params['training_set'] == 'FLAT':
-        inputs = tf.stack([depth_kinect[:, :, :, 1],
-                           depth_kinect[:,:,:,2] - depth_kinect[:,:,:,1],
-                           depth_kinect[:,:,:,0] - depth_kinect[:,:,:,1],
-                           amplitude_kinect[:,:,:,2] / amplitude_kinect[:,:,:,1] - 1,
-                           amplitude_kinect[:,:,:,0] / amplitude_kinect[:,:,:,1] - 1], -1)
+        # Ensure proper indexing for [B, C, H, W]
+        inputs = torch.cat([
+            depth_kinect[:, 1:2], # Assuming noisy has C=3
+            depth_kinect[:, 2:3] - depth_kinect[:, 1:2],
+            depth_kinect[:, 0:1] - depth_kinect[:, 1:2],
+            amplitude_kinect[:, 2:3] / (amplitude_kinect[:, 1:2] + 1e-8), # TF had -1, but this matches the TF data processing
+            amplitude_kinect[:, 0:1] / (amplitude_kinect[:, 1:2] + 1e-8) # TF had -1
+        ], dim=1)
+        # Re-adding -1 to match original TF logic, which was done in start.py for FLAT, cornellbox, Agresti_S1
+        inputs[:, 3:4] = inputs[:, 3:4] - 1
+        inputs[:, 4:5] = inputs[:, 4:5] - 1
     elif params['training_set'] == 'cornellbox':
-        inputs = tf.stack([depth_kinect[:, :, :, 2],
-                           depth_kinect[:, :, :, 0] - depth_kinect[:, :, :, 2],
-                           depth_kinect[:, :, :, 1] - depth_kinect[:, :, :, 2],
-                           amplitude_kinect[:, :, :, 0] / amplitude_kinect[:, :, :, 2] - 1,
-                           amplitude_kinect[:, :, :, 1] / amplitude_kinect[:, :, :, 2] - 1], -1)
+        inputs = torch.cat([
+            depth_kinect[:, 2:3], # TF depth_kinect[:,:,:,2]
+            depth_kinect[:, 0:1] - depth_kinect[:, 2:3], # TF depth_kinect[:,:,:,0] - depth_kinect[:,:,:,2]
+            depth_kinect[:, 1:2] - depth_kinect[:, 2:3], # TF depth_kinect[:,:,:,1] - depth_kinect[:,:,:,2]
+            amplitude_kinect[:, 0:1] / (amplitude_kinect[:, 2:3] + 1e-8), # TF amplitude_kinect[:,:,:,0] / amplitude_kinect[:,:,:,2]
+            amplitude_kinect[:, 1:2] / (amplitude_kinect[:, 2:3] + 1e-8) # TF amplitude_kinect[:,:,:,1] / amplitude_kinect[:,:,:,2]
+        ], dim=1)
+        inputs[:, 3:4] = inputs[:, 3:4] - 1
+        inputs[:, 4:5] = inputs[:, 4:5] - 1
     elif params['training_set'] == 'Agresti_S1':
-        inputs = tf.stack([depth_kinect[:, :, :, 2],
-                           depth_kinect[:, :, :, 0] - depth_kinect[:, :, :, 2],
-                           depth_kinect[:, :, :, 1] - depth_kinect[:, :, :, 2],
-                           amplitude_kinect[:, :, :, 0] / amplitude_kinect[:, :, :, 2] - 1,
-                           amplitude_kinect[:, :, :, 1] / amplitude_kinect[:, :, :, 2] - 1], -1)
+        inputs = torch.cat([
+            depth_kinect[:, 2:3], # TF depth_kinect[:,:,:,2]
+            depth_kinect[:, 0:1] - depth_kinect[:, 2:3], # TF depth_kinect[:,:,:,0] - depth_kinect[:,:,:,2]
+            depth_kinect[:, 1:2] - depth_kinect[:, 2:3], # TF depth_kinect[:,:,:,1] - depth_kinect[:,:,:,2]
+            amplitude_kinect[:, 0:1] / (amplitude_kinect[:, 2:3] + 1e-8), # TF amplitude_kinect[:,:,:,0] / amplitude_kinect[:,:,:,2]
+            amplitude_kinect[:, 1:2] / (amplitude_kinect[:, 2:3] + 1e-8) # TF amplitude_kinect[:,:,:,1] / amplitude_kinect[:,:,:,2]
+        ], dim=1)
+        inputs[:, 3:4] = inputs[:, 3:4] - 1
+        inputs[:, 4:5] = inputs[:, 4:5] - 1
     else:
-        inputs = depth_kinect
+        inputs = depth_kinect # Assuming depth_kinect is [B, C, H, W] already
 
-    depth_outs, depth_residual_every_scale = get_network(name=params['model_name'], x=inputs, flg=mode == tf.estimator.ModeKeys.TRAIN,
-                             regular=0.1, batch_size=params['batch_size'], range=params['deformable_range'])
+    # Get the appropriate loss mask for current mode
+    final_loss_msk = loss_mask_dict[params['loss_mask']] # Renamed to avoid clash with function param `loss_mask`
 
-    ## get the msk needed in compute loss and metrics
-    loss_msk = loss_mask_dict[params['loss_mask']]
+    return inputs, gt, final_loss_msk, depth_kinect, amplitude_kinect, rgb_kinect
 
-    # compute loss (for TRAIN and EVAL modes)
-    loss = None
-    train_op = None
-    metrics = None
-    evaluation_hooks = []
-
-    if (mode == tf.estimator.ModeKeys.TRAIN or mode == tf.estimator.ModeKeys.EVAL):
-
-        if params['add_gradient'] == 'sobel_gradient':
-            loss_iters_w = [0.7, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4]
-            # loss_iters_w = [0.75, 0.75, 0.75, 0.75]
-            loss_1 = get_supervised_loss(params['loss_fn'], depth_outs, gt, loss_msk)
-            loss_2 = get_supervised_loss('sobel_gradient', depth_outs * loss_msk, gt * loss_msk, loss_msk)
-            loss = loss_1 + 10.0 * loss_2
-            # for i in range(len(depth_residual_every_scale)):
-            #     w = loss_iters_w[i]
-            #     loss_1 = get_supervised_loss(params['loss_fn'], depth_residual_every_scale[i], gt, loss_msk)
-            #     loss_2 = get_supervised_loss('sobel_gradient', depth_residual_every_scale[i], gt, loss_msk)
-            #     loss += w * (loss_1 + 10.0 * loss_2)
-                # loss += w * loss_1
-        else:
-            loss = get_supervised_loss(params['loss_fn'], depth_outs, gt, loss_msk)
-        # configure the training op (for TRAIN mode)
-        if mode == tf.estimator.ModeKeys.TRAIN:
-            tf.summary.scalar('training_loss', loss)
-            global_step = tf.train.get_global_step()
-            learning_rate = tf.train.exponential_decay(params['learning_rate'], global_step=global_step, decay_steps= params['decay_epoch'] * int(params['samples_number'] / params['batch_size']), decay_rate=0.8)
-            optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-            with tf.control_dependencies(update_ops):
-                train_op = optimizer.minimize(loss, global_step=global_step)
-        if mode == tf.estimator.ModeKeys.EVAL:
-            if loss_msk == None:
-                amplitude_kinect_map = tf.identity(amplitude_kinect, 'amplitude_kinect')
-                depth_gt_map = tf.identity(gt, 'depth_gt')
-                depth_outs_map = tf.identity(depth_outs, 'depth_outs')
-                depth_kinect_map = tf.identity(depth_kinect, 'depth_kinect')
-                depth_outs_error = tf.identity(gt - depth_outs, 'depth_outs_error')
-                depth_kinect_error = tf.identity(gt - depth_kinect, 'depth_kinect_error')
-                depth_kinect_error_negative = depth_kinect_error * tf.cast(depth_kinect_error < 0, dtype=tf.float32)
-                tensor_min = tf.reduce_min(depth_kinect_error_negative, axis=[1, 2, 3], keepdims=True)
-                depth_kinect_error_negative = depth_kinect_error_negative / tensor_min
-                depth_kinect_error_positive = depth_kinect_error * tf.cast(depth_kinect_error >= 0, dtype=tf.float32)
-                tensor_max = tf.reduce_max(depth_kinect_error_negative, axis=[1, 2, 3], keepdims=True)
-                depth_kinect_error_positive = depth_kinect_error_positive / tensor_max
-                depth_outs_error_negative = depth_outs_error * tf.cast(depth_outs_error < 0, dtype=tf.float32)
-                depth_outs_error_negative = depth_outs_error_negative / tensor_min
-                depth_outs_error_positive = depth_outs_error * tf.cast(depth_outs_error >= 0, dtype=tf.float32)
-                depth_outs_error_positive = depth_outs_error_positive / tensor_max
-            else:
-                depth_gt_map = tf.identity(gt, 'depth_gt')
-                amplitude_kinect_map = tf.identity(amplitude_kinect, 'amplitude_kinect')
-                depth_outs_map = tf.identity(depth_outs * loss_msk, 'depth_outs')
-                depth_kinect_map = tf.identity(depth_kinect, 'depth_kinect')
-                depth_outs_error = tf.identity((gt * loss_msk - depth_outs * loss_msk), 'depth_outs_error')
-                depth_kinect_error = tf.identity((gt * loss_msk - depth_kinect * loss_msk), 'depth_kinect_error')
-                depth_kinect_error_negative = depth_kinect_error * tf.cast(depth_kinect_error < 0, dtype=tf.float32)
-                tensor_min = tf.reduce_min(depth_kinect_error_negative, axis=[1, 2, 3], keepdims=True)
-                depth_kinect_error_negative = depth_kinect_error_negative / tensor_min
-                depth_kinect_error_positive = depth_kinect_error * tf.cast(depth_kinect_error >= 0, dtype=tf.float32)
-                tensor_max = tf.reduce_max(depth_kinect_error_negative, axis=[1, 2, 3], keepdims=True)
-                depth_kinect_error_positive = depth_kinect_error_positive / tensor_max
-                depth_outs_error_negative = depth_outs_error * tf.cast(depth_outs_error < 0, dtype=tf.float32)
-                depth_outs_error_negative = depth_outs_error_negative / tensor_min
-                depth_outs_error_positive = depth_outs_error * tf.cast(depth_outs_error >= 0, dtype=tf.float32)
-                depth_outs_error_positive = depth_outs_error_positive / tensor_max
-
-
-            tf.summary.image('depth_gt', colorize_img(depth_gt_map, vmin=0.0, vmax=1.0, cmap='jet'))
-            # tf.summary.image('amplitude_kinect_map', amplitude_kinect_map)
-            # tf.summary.image('depth_outs', colorize_img(depth_outs_map, vmin=0.0, vmax=1.0, cmap='jet'))
-            # tf.summary.image('depth_kinect', colorize_img(depth_kinect_map, vmin=0.0, vmax=1.0, cmap='jet'))
-            # tf.summary.image('depth_outs_error', colorize_img(tf.abs(depth_outs_error), vmin=0.0, vmax=0.1, cmap='jet'))
-            # tf.summary.image('depth_kinect_error',colorize_img(tf.abs(depth_kinect_error), vmin=0.0, vmax=0.4, cmap='jet'))
-            # tf.summary.image('depth_outs_error_positive', colorize_img(depth_outs_error_positive, vmin=0.0, vmax=1.0, cmap='jet'))
-            # tf.summary.image('depth_kinect_error_positive', colorize_img(depth_kinect_error_positive, vmin=0.0, vmax=1.0, cmap='jet'))
-            # tf.summary.image('depth_outs_error_negative',colorize_img(depth_outs_error_negative, vmin=0.0, vmax=1.0, cmap='jet'))
-            # tf.summary.image('depth_kinect_error_negative',colorize_img(depth_kinect_error_negative, vmin=0.0, vmax=1.0, cmap='jet'))
-            ## get metrics
-            if params['training_set'] == 'tof_FT3':
-                depth_outs = depth_outs * 409.5
-                depth_kinect = depth_kinect * 409.5
-                gt = gt * 409.5
-                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs, depth_kinect , gt, loss_msk)
-            elif params['training_set'] == 'RGBDD':
-                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs, depth_kinect , gt, loss_msk)
-            elif params['training_set'] == 'cornellbox':
-                depth_kinect_test2 = tf.expand_dims(depth_kinect[:, :, :, 1], -1) * 100.0
-                depth_kinect_test1 = tf.expand_dims(depth_kinect[:, :, :, 2], -1)
-                depth_outs = depth_outs * 100.0
-                depth_kinect_test1 = depth_kinect_test1 * 100.0
-                gt_test = gt * 100.0
-                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(
-                    depth_outs, depth_kinect_test1, gt_test, loss_msk)
-            elif params['training_set'] == 'FLAT':
-                depth_kinect = tf.expand_dims(depth_kinect[:,:,:,1], -1)
-                depth_outs = depth_outs * 100.0
-                depth_kinect = depth_kinect * 100.0
-                gt = gt * 100.0
-                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(
-                    depth_outs, depth_kinect, gt, loss_msk)
-            elif params['training_set'] == 'Agresti_S1':
-                # depth_kinect = tf.expand_dims(depth_kinect[:,:,:,1],-1) + tf.expand_dims(depth_kinect[:,:,:,0],-1)
-                depth_kinect = tf.expand_dims(depth_kinect[:, :, :, 2], -1)
-                depth_outs = depth_outs * 100.0
-                depth_kinect = depth_kinect * 100.0
-                # msk = tf.cast(gt > 0.0000001, tf.float32)
-                gt = gt * 100.0
-                # gt_test = tf.zeros_like(gt)
-                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(
-                    depth_outs, depth_kinect, gt, loss_msk)
-            elif params['training_set'] == 'TB':
-                depth_outs = depth_outs * 200.0
-                depth_kinect = depth_kinect * 200.0
-                gt = gt * 200.0
-                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(
-                    depth_outs, depth_kinect, gt, loss_msk)
-
-            metrics = {
-                "ori_MAE": ori_mae,
-                "pre_MAE": pre_mae,
-                'pre_mae_percent_25':pre_mae_percent_25,
-                'pre_mae_percent_50':pre_mae_percent_50,
-                'pre_mae_percent_75':pre_mae_percent_75,
-            }
-            eval_summary_hook = tf.train.SummarySaverHook(
-                                save_steps=1,
-                                output_dir= params['model_dir'] + "/eval",
-                                summary_op=tf.summary.merge_all())
-            evaluation_hooks.append(eval_summary_hook)
-            return tf.estimator.EstimatorSpec(
-                mode=mode,
-                loss=loss,
-                eval_metric_ops=metrics,
-                evaluation_hooks=evaluation_hooks
-            )
-
-    if mode == tf.estimator.ModeKeys.PREDICT:
-        predictions = {
-            "depth_input": depth_kinect,
-            "irs_input": amplitude_kinect,
-            "depth": depth_outs,
-            # "offset": offsets
-        }
-    else:
-        predictions = None
-
-    # return a ModelFnOps object
-    return tf.estimator.EstimatorSpec(
-        mode=mode,
-        predictions=predictions,
-        loss=loss,
-        train_op=train_op,
-        eval_metric_ops=metrics,
-    )
 
 def dataset_training(train_data_path, evaluate_data_path, model_dir, loss_fn, learning_rate, batch_size, traing_steps,
                      evaluate_steps, deformable_range, model_name, checkpoint_steps, loss_mask, gpu_Number,
                      training_set, image_shape, samples_number, add_gradient, decay_epoch):
-    """
-    This function represents the training mode of the code
-    :param train_data_path:
-    :param evaluate_data_path:
-    :param model_dir:
-    :param loss_fn:
-    :param learning_rate:
-    :param batch_size:
-    :param traing_steps:
-    :param evaluate_steps:
-    :param deformable_range:
-    :param model_name:
-    :param checkpoint_steps:
-    :param loss_mask:
-    :param gpu_Number:
-    :param training_set:
-    :param image_shape:
-    :return: no return
-    """
-    strategy = tf.contrib.distribute.MirroredStrategy(num_gpus=gpu_Number)
-    # session_config = tf.ConfigProto(device_count=gpu_device_number_list[gpu_Number - 1])
-    configuration = tf.estimator.RunConfig(
-        model_dir=model_dir,
-        keep_checkpoint_max=10,
-        save_checkpoints_steps=evaluate_steps,
-        # session_config=session_config,
-        save_summary_steps=50,
-        log_step_count_steps=20,
-        train_distribute=strategy,
-    )  # set the frequency of logging steps for loss function
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # Instantiate the model
+    model = get_network(name=model_name, flg=True, regular=0.1, batch_size=batch_size, deformable_range=deformable_range).to(device)
+    
+    if model_name.lower() == 'sample_pyramid_add_kpn':
+        dummy_input = torch.randn(batch_size, 2, 384, 512).to(device)
+        _ = model(dummy_input)
 
-    tof_net = tf.estimator.Estimator(model_fn=tof_net_func, config=configuration,
-                                     params={'learning_rate': learning_rate, 'batch_size': batch_size, 'model_dir': model_dir,
-                                             'loss_fn': loss_fn, 'deformable_range': deformable_range, 'model_name': model_name,
-                                             'loss_mask': loss_mask, 'output_flg':False, 'training_set': training_set,
-                                             'samples_number': samples_number, 'add_gradient': add_gradient, 'decay_epoch':decay_epoch})
+    if gpu_Number > 1 and torch.cuda.device_count() >= gpu_Number:
+        print(f"Using {gpu_Number} GPUs for DataParallel.")
+        model = nn.DataParallel(model, device_ids=list(range(gpu_Number)))
+    else:
+        print(f"Running on single GPU or CPU: {device}. Check GPU setup if multi-GPU intended.")
 
-    print('##############################')
-    # print(sum([np.prod(tof_net.get_variable_value(var).shape) for var in tof_net.get_variable_names()]))
+    stats_graph(model)
 
-    train_spec = tf.estimator.TrainSpec(input_fn=lambda: get_input_fn(training_set=training_set, filenames=train_data_path, height=image_shape[0], width=image_shape[1],
-                                                               shuffle=True, repeat_count=-1, batch_size=batch_size),
-                                        max_steps=traing_steps)
-    eval_spec = tf.estimator.EvalSpec(input_fn=lambda: get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
-                                                             shuffle=False, repeat_count=1, batch_size=batch_size),
-                                      steps=None, throttle_secs=evaluate_steps)
-    tf.estimator.train_and_evaluate(tof_net, train_spec, eval_spec)
+    train_loader = get_input_fn(training_set=training_set, filenames=train_data_path, height=image_shape[0], width=image_shape[1],
+                                shuffle=True, repeat_count=1, batch_size=batch_size) # Set repeat_count=1 for proper epoch control
+    eval_loader = get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
+                               shuffle=False, repeat_count=1, batch_size=batch_size)
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    batches_per_epoch = len(train_loader) if len(train_loader) > 0 else 1 # Avoid division by zero
+    decay_interval_steps = decay_epoch * batches_per_epoch
+
+    global_step = 0
+    # Determine number of epochs needed to reach traing_steps (total iterations)
+    num_epochs_to_run = (traing_steps + batches_per_epoch - 1) // batches_per_epoch
+
+    # Main progress bar for overall training
+    main_pbar = tqdm(total=traing_steps, desc="Training Progress", unit="step")
+
+    for epoch in range(num_epochs_to_run):
+        model.train()
+        epoch_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs_to_run}", leave=False)
+        for batch_idx, (features, labels) in enumerate(epoch_pbar):
+            if global_step >= traing_steps:
+                break
+
+            inputs, gt, final_loss_msk, _, _, _ = process_inputs(features, labels, {'training_set': training_set, 'output_flg': False, 'loss_mask': loss_mask}, 'train', device)
+            optimizer.zero_grad()
+            
+            depth_outs, depth_residual_every_scale = model(inputs)
+            #fig, axs = plt.subplots(1, 3, figsize=(16, 5))  # 1行2列子图
+
+            # GT 图像
+            #im0 = axs[0].imshow(gt[0, 0].cpu(), cmap='jet')
+            #axs[0].set_title('GT')
+            #plt.colorbar(im0, ax=axs[0])
+
+            # output 图像
+            #im1 = axs[1].imshow(depth_outs[0, 0].detach().cpu(), cmap='jet')
+            #axs[1].set_title('depth_outs')
+            #plt.colorbar(im1, ax=axs[1])
+
+            # Input 图像
+            #im1 = axs[2].imshow(inputs[0, 0].detach().cpu(), cmap='jet')
+            #axs[1].set_title('inputs')
+            #plt.colorbar(im1, ax=axs[1])
+            # 保存整个图像为一个文件
+            #plt.tight_layout()
+            #plt.savefig("gt_in_output_comparison.png")
+            #plt.close()
+            
+            if add_gradient == 'sobel_gradient':
+                loss_1 = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
+                loss_2 = get_supervised_loss('sobel_gradient', depth_outs * final_loss_msk, gt * final_loss_msk, final_loss_msk)
+                loss = loss_1 + 1.0 * loss_2
+            else:
+                loss = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
+            
+            loss.backward()
+            optimizer.step()
+
+            # Update progress bars
+            main_pbar.update(1)
+            epoch_pbar.set_postfix({
+                'Loss': f'{loss.item():.6f}',
+                'LR': f'{optimizer.param_groups[0]["lr"]:.8f}',
+                'Step': f'{global_step+1}/{traing_steps}'
+            })
+
+            if (global_step + 1) % 20 == 0: # log_step_count_steps
+                print(f'Global Step: {global_step+1}/{traing_steps}, Epoch: {epoch+1}, Batch: {batch_idx+1}/{batches_per_epoch}, Training Loss: {loss.item():.6f}, Current LR: {optimizer.param_groups[0]["lr"]:.8f}')
+
+            global_step += 1
+            if (global_step % decay_interval_steps == 0) and (global_step < traing_steps):
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= 0.8
+                print(f"Learning rate decayed to {optimizer.param_groups[0]['lr']} at step {global_step}")
+
+        epoch_pbar.close()
+        if global_step >= traing_steps:
+            break
+
+        # Evaluation
+        eval_interval = max(evaluate_steps // batches_per_epoch, 1)
+        if (epoch + 1) % eval_interval == 0:
+            # do evaluation
+            print(f'\n--- Starting Evaluation for Epoch {epoch+1} ---')
+            model.eval()
+            eval_loss_total = 0
+            ori_mae_total, pre_mae_total = 0.0, 0.0
+            pre_mae_25_total, pre_mae_50_total, pre_mae_75_total = 0.0, 0.0, 0.0
+            count = 0
+
+            with torch.no_grad():
+                eval_pbar = tqdm(eval_loader, desc="Evaluating", leave=False)
+                for eval_batch_idx, (features, labels) in enumerate(eval_pbar):
+                    inputs, gt, final_loss_msk, depth_kinect, amplitude_kinect, rgb_kinect = process_inputs(features, labels, {'training_set': training_set, 'output_flg': False, 'loss_mask': loss_mask}, 'eval', device)
+
+                    depth_outs, _ = model(inputs)
+
+                    # Calculate loss
+                    if add_gradient == 'sobel_gradient':
+                        loss_1 = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
+                        loss_2 = get_supervised_loss('sobel_gradient', depth_outs * final_loss_msk, gt * final_loss_msk, final_loss_msk)
+                        eval_loss = loss_1 + 1.0 * loss_2
+                    else:
+                        eval_loss = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
+                    eval_loss_total += eval_loss.item()
+
+                    # Calculate metrics
+                    if training_set == 'tof_FT3':
+                        depth_outs_m = depth_outs
+                        depth_kinect_m = depth_kinect
+                        gt_m = gt
+                        ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+                    elif training_set == 'RGBDD':
+                        ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs, depth_kinect, gt, final_loss_msk)
+                    elif training_set == 'cornellbox':
+                        depth_kinect_test1 = depth_kinect[:, 2:3] * 100.0 # TF depth_kinect[:, :, :, 2]
+                        depth_outs_m = depth_outs * 100.0
+                        gt_m = gt * 100.0
+                        ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_test1, gt_m, final_loss_msk)
+                    elif training_set == 'FLAT':
+                        depth_kinect_m = depth_kinect[:, 1:2] * 100.0 # TF depth_kinect[:,:,:,1]
+                        depth_outs_m = depth_outs * 100.0
+                        gt_m = gt * 100.0
+                        ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+                    elif training_set == 'Agresti_S1':
+                        depth_kinect_m = depth_kinect[:, 2:3] * 100.0 # TF depth_kinect[:,:,:,2]
+                        depth_outs_m = depth_outs * 100.0
+                        gt_m = gt * 100.0
+                        ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+                    elif training_set == 'TB':
+                        depth_outs_m = depth_outs * 200.0
+                        depth_kinect_m = depth_kinect * 200.0
+                        gt_m = gt * 200.0
+                        ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+                    else:
+                        ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs, depth_kinect, gt, final_loss_msk)
+
+                    ori_mae_total += ori_mae.item()
+                    pre_mae_total += pre_mae.item()
+                    pre_mae_25_total += pre_mae_percent_25.item()
+                    pre_mae_50_total += pre_mae_percent_50.item()
+                    pre_mae_75_total += pre_mae_percent_75.item()
+                    count += 1
+                    
+                    # Update evaluation progress bar
+                    eval_pbar.set_postfix({
+                        'Eval Loss': f'{eval_loss.item():.6f}',
+                        'Pre MAE': f'{pre_mae.item():.6f}'
+                    })
+                
+                eval_pbar.close()
+            avg_eval_loss = eval_loss_total / count if count > 0 else 0
+            avg_ori_mae = ori_mae_total / count if count > 0 else 0
+            avg_pre_mae = pre_mae_total / count if count > 0 else 0
+            avg_pre_mae_25 = pre_mae_25_total / count if count > 0 else 0
+            avg_pre_mae_50 = pre_mae_50_total / count if count > 0 else 0
+            avg_pre_mae_75 = pre_mae_75_total / count if count > 0 else 0
+
+            print(f'Epoch {epoch+1} Evaluation:')
+            print(f'  Avg Loss: {avg_eval_loss:.6f}')
+            print(f'  Ori MAE: {avg_ori_mae:.6f}')
+            print(f'  Pre MAE: {avg_pre_mae:.6f}')
+            print(f'  Pre MAE 25%: {avg_pre_mae_25:.6f}')
+            print(f'  Pre MAE 50%: {avg_pre_mae_50:.6f}')
+            print(f'  Pre MAE 75%: {avg_pre_mae_75:.6f}')
+            print(f'--- End Evaluation ---')
+
+            # Save checkpoint
+            checkpoint_save_step = (epoch + 1) * batches_per_epoch # Save based on actual steps completed
+            if checkpoint_save_step >= int(checkpoint_steps) or (epoch + 1) == num_epochs_to_run: # Save if current step exceeds/equals target, or it's the last epoch
+                checkpoint_path = os.path.join(model_dir, f'model.ckpt-{checkpoint_save_step}.pth')
+                torch.save({
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_eval_loss,
+                }, checkpoint_path)
+                print(f"Checkpoint saved to {checkpoint_path}")
+
+    main_pbar.close()
+    print(f"\nTraining finished after {global_step} steps.")
+
+
 def dataset_testing(evaluate_data_path, model_dir, batch_size, checkpoint_steps, deformable_range,
                     loss_fn, model_name, loss_mask, gpu_Number, training_set, image_shape, add_gradient):
-    """
-    This function represents the eval mode of the code
-    :param evaluate_data_path:
-    :param model_dir:
-    :param batch_size:
-    :param checkpoint_steps:
-    :param deformable_range:
-    :param loss_fn:
-    :param model_name:
-    :param loss_mask:
-    :param gpu_Number:
-    :param training_set:
-    :param image_shape:
-    :return:
-    """
-    strategy = tf.contrib.distribute.MirroredStrategy(num_gpus=gpu_Number)
-    # session_config = tf.ConfigProto(device_count=gpu_device_number_list[gpu_Number - 1])
-    configuration = tf.estimator.RunConfig(
-        model_dir=model_dir,
-        # session_config=session_config,
-        log_step_count_steps = 10,
-        save_summary_steps = 5,
-        train_distribute=strategy,
-    )
-    tof_net = tf.estimator.Estimator(model_fn=tof_net_func, config=configuration,
-        params={'learning_rate': 1e-4, 'batch_size': batch_size, 'model_dir': model_dir,
-                'deformable_range': deformable_range, 'loss_fn':loss_fn,'add_gradient':add_gradient,
-                'model_name': model_name, 'loss_mask': loss_mask, 'output_flg':False, 'training_set': training_set})
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # Instantiate the model
+    model = get_network(name=model_name, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range).to(device)
 
-    tof_net.evaluate(input_fn=lambda: get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
-        shuffle=False, repeat_count=1, batch_size=batch_size), checkpoint_path=model_dir + '/model.ckpt-' + checkpoint_steps)
+    if gpu_Number > 1 and torch.cuda.device_count() >= gpu_Number:
+        print(f"Using {gpu_Number} GPUs for DataParallel during testing.")
+        model = nn.DataParallel(model, device_ids=list(range(gpu_Number)))
+    else:
+        print(f"Running on single GPU or CPU: {device} during testing. Check GPU setup if multi-GPU intended.")
+
+    # Load checkpoint
+    checkpoint_path = os.path.join(model_dir, f'model.ckpt-{checkpoint_steps}.pth')
+    if not os.path.exists(checkpoint_path):
+        ckpts = [f for f in os.listdir(model_dir) if f.startswith('model.ckpt-') and f.endswith('.pth')]
+        if ckpts:
+            # Sort by the step number in the filename
+            latest_ckpt = sorted(ckpts, key=lambda x: int(x.split('-')[1].split('.')[0]))[-1]
+            checkpoint_path = os.path.join(model_dir, latest_ckpt)
+            print(f"Warning: Checkpoint '{checkpoint_steps}' not found. Loading latest checkpoint: {latest_ckpt}")
+        else:
+            raise FileNotFoundError(f"No checkpoint found in {model_dir} for step {checkpoint_steps}")
+
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device)['model_state_dict'])
+    model.eval()
+
+    eval_loader = get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
+                               shuffle=False, repeat_count=1, batch_size=batch_size)
+
+    eval_loss_total = 0
+    ori_mae_total, pre_mae_total = 0.0, 0.0
+    pre_mae_25_total, pre_mae_50_total, pre_mae_75_total = 0.0, 0.0, 0.0
+    count = 0
+
+    print(f'\n--- Starting Testing from checkpoint {checkpoint_steps} ---')
+    with torch.no_grad():
+        test_pbar = tqdm(eval_loader, desc="Testing", leave=False)
+        for eval_batch_idx, (features, labels) in enumerate(test_pbar):
+            inputs, gt, final_loss_msk, depth_kinect, amplitude_kinect, rgb_kinect = process_inputs(features, labels, {'training_set': training_set, 'output_flg': False, 'loss_mask': loss_mask}, 'eval', device)
+
+            depth_outs, _ = model(inputs, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range)
+
+            # Calculate loss
+            if add_gradient == 'sobel_gradient':
+                loss_1 = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
+                loss_2 = get_supervised_loss('sobel_gradient', depth_outs * final_loss_msk, gt * final_loss_msk, final_loss_msk)
+                eval_loss = loss_1 + 10.0 * loss_2
+            else:
+                eval_loss = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
+            eval_loss_total += eval_loss.item()
+
+            # Calculate metrics (same logic as in training)
+            if training_set == 'tof_FT3':
+                depth_outs_m = depth_outs * 409.5
+                depth_kinect_m = depth_kinect * 409.5
+                gt_m = gt * 409.5
+                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+            elif training_set == 'RGBDD':
+                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs, depth_kinect, gt, final_loss_msk)
+            elif training_set == 'cornellbox':
+                depth_kinect_test1 = depth_kinect[:, 2:3] * 100.0
+                depth_outs_m = depth_outs * 100.0
+                gt_m = gt * 100.0
+                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_test1, gt_m, final_loss_msk)
+            elif training_set == 'FLAT':
+                depth_kinect_m = depth_kinect[:, 1:2] * 100.0
+                depth_outs_m = depth_outs * 100.0
+                gt_m = gt * 100.0
+                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+            elif training_set == 'Agresti_S1':
+                depth_kinect_m = depth_kinect[:, 2:3] * 100.0
+                depth_outs_m = depth_outs * 100.0
+                gt_m = gt * 100.0
+                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+            elif training_set == 'TB':
+                depth_outs_m = depth_outs * 200.0
+                depth_kinect_m = depth_kinect * 200.0
+                gt_m = gt * 200.0
+                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
+            else:
+                ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs, depth_kinect, gt, final_loss_msk)
+
+            ori_mae_total += ori_mae.item()
+            pre_mae_total += pre_mae.item()
+            pre_mae_25_total += pre_mae_percent_25.item()
+            pre_mae_50_total += pre_mae_percent_50.item()
+            pre_mae_75_total += pre_mae_percent_75.item()
+            count += 1
+            
+            # Update test progress bar
+            test_pbar.set_postfix({
+                'Test Loss': f'{eval_loss.item():.6f}',
+                'Pre MAE': f'{pre_mae.item():.6f}'
+            })
+        
+        test_pbar.close()
+    avg_eval_loss = eval_loss_total / count if count > 0 else 0
+    avg_ori_mae = ori_mae_total / count if count > 0 else 0
+    avg_pre_mae = pre_mae_total / count if count > 0 else 0
+    avg_pre_mae_25 = pre_mae_25_total / count if count > 0 else 0
+    avg_pre_mae_50 = pre_mae_50_total / count if count > 0 else 0
+    avg_pre_mae_75 = pre_mae_75_total / count if count > 0 else 0
+
+    print(f'Testing Results from checkpoint {checkpoint_steps}:')
+    print(f'  Avg Loss: {avg_eval_loss:.6f}')
+    print(f'  Ori MAE: {avg_ori_mae:.6f}')
+    print(f'  Pre MAE: {avg_pre_mae:.6f}')
+    print(f'  Pre MAE 25%: {avg_pre_mae_25:.6f}')
+    print(f'  Pre MAE 50%: {avg_pre_mae_50:.6f}')
+    print(f'  Pre MAE 75%: {avg_pre_mae_75:.6f}')
+    print(f'--- End Testing ---')
+
 
 def dataset_output(result_path, evaluate_data_path, model_dir, batch_size, checkpoint_steps, deformable_range,
                    loss_fn, model_name, loss_mask, gpu_Number, training_set, image_shape):
-    """
-    This function represents the output mode of the code
-    :param result_path:
-    :param evaluate_data_path:
-    :param model_dir:
-    :param batch_size:
-    :param checkpoint_steps:
-    :param deformable_range:
-    :param loss_fn:
-    :param model_name:
-    :param loss_mask:
-    :param gpu_Number:
-    :param training_set:
-    :param image_shape:
-    :return:
-    """
-    strategy = tf.contrib.distribute.MirroredStrategy(num_gpus=gpu_Number)
-    # session_config = tf.ConfigProto(device_count=gpu_device_number_list[gpu_Number - 1])
-    configuration = tf.estimator.RunConfig(
-        model_dir=model_dir,
-        # session_config=session_config,
-        log_step_count_steps = 10,
-        save_summary_steps = 5,
-        train_distribute=strategy,
-    )
-    tof_net = tf.estimator.Estimator(model_fn=tof_net_func, config=configuration,
-        params={'learning_rate': 1e-4, 'batch_size': batch_size, 'model_dir': model_dir,
-                'deformable_range': deformable_range, 'loss_fn':loss_fn,
-                'model_name': model_name, 'loss_mask': loss_mask, 'output_flg':True, 'training_set': training_set})
-    result = list(tof_net.predict(input_fn=lambda: get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
-                shuffle=False, repeat_count=1, batch_size=batch_size), checkpoint_path=model_dir + '/model.ckpt-' + checkpoint_steps))
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # Instantiate the model
+    model = get_network(name=model_name, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range).to(device)
 
-    root_dir = result_path
-    pre_depth_dir = os.path.join(root_dir, 'pre_depth')
-    depth_input_dir = os.path.join(root_dir, 'depth_input')
-    amplitude_dir = os.path.join(root_dir, 'amplitude')
-    depth_input_png_dir = os.path.join(root_dir, 'depth_input_png')
-    pre_depth_png_dir = os.path.join(root_dir, 'pre_depth_png')
-    amplitude_png_dir = os.path.join(root_dir, 'amplitude_png')
-    if not os.path.exists(pre_depth_dir):
-        os.mkdir(pre_depth_dir)
-    if not os.path.exists(depth_input_dir):
-        os.mkdir(depth_input_dir)
-    if not os.path.exists(amplitude_dir):
-        os.mkdir(amplitude_dir)
-    if not os.path.exists(depth_input_png_dir):
-        os.mkdir(depth_input_png_dir)
-    if not os.path.exists(pre_depth_png_dir):
-        os.mkdir(pre_depth_png_dir)
-    if not os.path.exists(amplitude_png_dir):
-        os.mkdir(amplitude_png_dir)
+    if gpu_Number > 1 and torch.cuda.device_count() >= gpu_Number:
+        print(f"Using {gpu_Number} GPUs for DataParallel during output.")
+        model = nn.DataParallel(model, device_ids=list(range(gpu_Number)))
+    else:
+        print(f"Running on single GPU or CPU: {device} during output. Check GPU setup if multi-GPU intended.")
 
-    for i in range(len(result)):
+    # Load checkpoint
+    checkpoint_path = os.path.join(model_dir, f'model.ckpt-{checkpoint_steps}.pth')
+    if not os.path.exists(checkpoint_path):
+        ckpts = [f for f in os.listdir(model_dir) if f.startswith('model.ckpt-') and f.endswith('.pth')]
+        if ckpts:
+            latest_ckpt = sorted(ckpts, key=lambda x: int(x.split('-')[1].split('.')[0]))[-1]
+            checkpoint_path = os.path.join(model_dir, latest_ckpt)
+            print(f"Warning: Checkpoint '{checkpoint_steps}' not found. Loading latest checkpoint: {latest_ckpt}")
+        else:
+            raise FileNotFoundError(f"No checkpoint found in {model_dir} for step {checkpoint_steps}")
+
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device)['model_state_dict'])
+    model.eval()
+
+    output_loader = get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
+                                 shuffle=False, repeat_count=1, batch_size=batch_size)
+
+    all_depth_outs = []
+    all_depth_kinect = []
+    all_amplitude_kinect = []
+
+    print(f'\n--- Starting Output Generation from checkpoint {checkpoint_steps} ---')
+    with torch.no_grad():
+        output_pbar = tqdm(output_loader, desc="Output Generation", leave=False)
+        for batch_idx, (features, labels) in enumerate(output_pbar):
+            # output_flg is True for output mode
+            inputs, gt_ignored, loss_msk_ignored, depth_kinect, amplitude_kinect, rgb_kinect = \
+                process_inputs(features, labels, {'training_set': training_set, 'output_flg': True, 'loss_mask': loss_mask}, 'predict', device)
+
+            depth_outs, _ = model(inputs, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range)
+
+            all_depth_outs.append(depth_outs.cpu().numpy())
+            all_depth_kinect.append(depth_kinect.cpu().numpy())
+            all_amplitude_kinect.append(amplitude_kinect.cpu().numpy())
+            
+            # Update output progress bar
+            output_pbar.set_postfix({
+                'Batch': f'{batch_idx+1}/{len(output_loader)}'
+            })
+        
+        output_pbar.close()
+
+    # Concatenate all batches
+    pre_depths = np.concatenate(all_depth_outs, axis=0)
+    input_depths = np.concatenate(all_depth_kinect, axis=0)
+    amplitudes = np.concatenate(all_amplitude_kinect, axis=0)
+
+    # Create output directories
+    os.makedirs(result_path, exist_ok=True)
+    pre_depth_dir = os.path.join(result_path, 'pre_depth')
+    depth_input_dir = os.path.join(result_path, 'depth_input')
+    amplitude_dir = os.path.join(result_path, 'amplitude')
+    depth_input_png_dir = os.path.join(result_path, 'depth_input_png')
+    pre_depth_png_dir = os.path.join(result_path, 'pre_depth_png')
+    amplitude_png_dir = os.path.join(result_path, 'amplitude_png')
+
+    os.makedirs(pre_depth_dir, exist_ok=True)
+    os.makedirs(depth_input_dir, exist_ok=True)
+    os.makedirs(amplitude_dir, exist_ok=True)
+    os.makedirs(depth_input_png_dir, exist_ok=True)
+    os.makedirs(pre_depth_png_dir, exist_ok=True)
+    os.makedirs(amplitude_png_dir, exist_ok=True)
+
+    # Progress bar for saving files
+    save_pbar = tqdm(range(len(pre_depths)), desc="Saving Files")
+    for i in save_pbar:
         pre_depth_path = os.path.join(pre_depth_dir, str(i))
         depth_input_path = os.path.join(depth_input_dir, str(i))
         amplitude_path = os.path.join(amplitude_dir, str(i))
         depth_input_png_path = os.path.join(depth_input_png_dir, str(i)+'.png')
         pre_depth_png_path = os.path.join(pre_depth_png_dir, str(i) + '.png')
         amplitude_png_path = os.path.join(amplitude_png_dir, str(i) + '.png')
-        pre_depth = np.squeeze(result[i]['depth'])
-        input_depth = np.squeeze(result[i]['depth_input'])
-        amplitude = np.squeeze(result[i]['irs_input'])
-        input_depth_png = input_depth * 100
-        pre_depth_png = pre_depth * 100
-        amplitude_png = amplitude * 255
 
-        print(input_depth_png.shape)
-        pre_depth = np.reshape(pre_depth, -1).astype(np.float32)
-        input_depth = np.reshape(input_depth, -1).astype(np.float32)
-        amplitude = np.reshape(amplitude, -1).astype(np.float32)
+        pre_depth = np.squeeze(pre_depths[i])
+        input_depth = np.squeeze(input_depths[i])
+        amplitude = np.squeeze(amplitudes[i])
 
-        input_depth_png = Image.fromarray(input_depth_png)
-        input_depth_png = input_depth_png.convert("L")
-        input_depth_png.save(depth_input_png_path)
+        # Convert to appropriate scale for saving as PNG
+        # Assuming these are 0-1 normalized values, scaling to 0-255 for 8-bit PNG
+        input_depth_display = np.clip(input_depth * 100, 0, 255).astype(np.uint8)
+        pre_depth_display = np.clip(pre_depth * 100, 0, 255).astype(np.uint8)
+        amplitude_display = np.clip(amplitude * 255, 0, 255).astype(np.uint8)
 
-        pre_depth_png = Image.fromarray(pre_depth_png)
-        pre_depth_png = pre_depth_png.convert("L")
-        pre_depth_png.save(pre_depth_png_path)
+        # Ensure 2D for grayscale image saving
+        if input_depth_display.ndim == 3 and input_depth_display.shape[-1] == 1:
+            input_depth_display = input_depth_display.squeeze(-1)
+        if pre_depth_display.ndim == 3 and pre_depth_display.shape[-1] == 1:
+            pre_depth_display = pre_depth_display.squeeze(-1)
+        if amplitude_display.ndim == 3 and amplitude_display.shape[-1] == 1:
+            amplitude_display = amplitude_display.squeeze(-1)
 
-        amplitude_png = Image.fromarray(amplitude_png)
-        amplitude_png = amplitude_png.convert("L")
-        amplitude_png.save(amplitude_png_path)
 
-        amplitude.tofile(amplitude_path)
-        pre_depth.tofile(pre_depth_path)
-        input_depth.tofile(depth_input_path)
+        Image.fromarray(input_depth_display, 'L').save(depth_input_png_path)
+        Image.fromarray(pre_depth_display, 'L').save(pre_depth_png_path)
+        Image.fromarray(amplitude_display, 'L').save(amplitude_png_path)
+
+        # Save raw float data
+        pre_depth.astype(np.float32).tofile(pre_depth_path)
+        input_depth.astype(np.float32).tofile(depth_input_path)
+        amplitude.astype(np.float32).tofile(amplitude_path)
+        
+        # Update save progress bar
+        save_pbar.set_postfix({
+            'File': f'{i+1}/{len(pre_depths)}'
+        })
+    
+    save_pbar.close()
+
+    print(f'--- Output Generation Finished. Results saved to {result_path} ---')
 
 
 if __name__ == '__main__':
@@ -555,7 +655,7 @@ if __name__ == '__main__':
     parser.add_argument("-t", "--trainingSet", help='the name to the list file with training set', default = 'FLAT_reflection_s5', type=str)
     parser.add_argument("-m", "--modelName", help="name of the denoise model to be used", default="deformable_kpn")
     parser.add_argument("-l", "--lr", help="initial value for learning rate", default=1e-5, type=float)
-    parser.add_argument("-i", "--imageShape", help='two int for image shape [height,width]', nargs='+', type=int, default=[239, 320])##default=[424, 512]
+    parser.add_argument("-i", "--imageShape", help='two int for image shape [height,width]', nargs='+', type=int, default=[239, 320])
     parser.add_argument("-b", "--batchSize", help='batch size to use during training', type=int, default=4)
     parser.add_argument("-s", "--steps", help='number of training steps', type=int, default=4000)
     parser.add_argument("-e", "--evalSteps", help='after the number of training steps to eval', type=int, default=400)
@@ -565,7 +665,7 @@ if __name__ == '__main__':
     parser.add_argument("-p", '--postfix', help="the postfix of the training task", default=None, type=str)
     parser.add_argument("-c", '--checkpointSteps', help="select the checkpoint of the model", default="800", type=str)
     parser.add_argument("-k", '--lossMask', help="the mask used in compute loss", default='gt_msk', type=str)
-    parser.add_argument("-g", '--gpuNumber', help="The number of GPU used in training", default=2, type=int)
+    parser.add_argument("-g", '--gpuNumber', help="The number of GPU used in training", default=1, type=int)
     parser.add_argument('--samplesNumber', help="samples number in one epoch", default=5800, type=int)
     parser.add_argument('--addGradient', help="add the gradient loss function", default='sobel_gradient', type=str)
     parser.add_argument('--decayEpoch', help="after n epoch, decay the learning rate", default=2, type=int)
@@ -575,32 +675,32 @@ if __name__ == '__main__':
     if args.shmFlag == True:
         dataset_dir = '/dev/shm/dataset/tfrecords'
     else:
-        # dataset_dir = '/data/1015323606/RGB-D-D/tfrecords'
-        dataset_dir = '/data/1015323606/ToFFlyingThings3D/tfrecords'
-    model_dir = '/data/1015323606/ToFFlyingThings3D/ToFDenoisingTF_pretrain/' + args.modelName
-    if not os.path.exists(model_dir):
-        os.mkdir(model_dir)
+        dataset_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data/dataset')
+    
+    model_base_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data/models')
+    model_dir = os.path.join(model_base_dir, args.modelName)
+    os.makedirs(model_dir, exist_ok=True)
 
     if args.modelName[0:10] == 'deformable':
         mkdir_name = args.trainingSet + '_' + args.lossType + '_dR' + str(args.deformableRange)
-    # elif args.trainingSet == 'TB':
-    #     mkdir_name = 'tof_FT3' + '_' + args.lossType
     else:
         mkdir_name = args.trainingSet + '_' + args.lossType
     if args.postfix is not None:
         model_dir = os.path.join(model_dir, mkdir_name + '_' + args.postfix)
     else:
         model_dir = os.path.join(model_dir, mkdir_name)
-    if not os.path.exists(model_dir):
-        os.mkdir(model_dir)
+    os.makedirs(model_dir, exist_ok=True)
 
     output_dir = os.path.join(model_dir, 'output')
-    if not os.path.exists(output_dir):
-        os.mkdir(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     dataset_path = os.path.join(dataset_dir, args.trainingSet)
-    train_data_path = os.path.join(dataset_path, args.trainingSet + '_train.tfrecords')
-    evaluate_data_path = os.path.join(dataset_path, args.trainingSet + '_eval.tfrecords')
+    train_data_path = os.path.join(dataset_path, args.trainingSet + '_train')
+    evaluate_data_path = os.path.join(dataset_path, args.trainingSet + '_test')
+    
+    # Correct the evaluate_data_path for 'eval_ED' or 'output' mode, which uses '_test' originally in pytorch version
+    if args.flagMode == 'eval_ED' or args.flagMode == 'output':
+         evaluate_data_path = os.path.join(dataset_path, args.trainingSet + '_test')
 
 
     if args.flagMode == 'train':
@@ -617,14 +717,13 @@ if __name__ == '__main__':
                         add_gradient=args.addGradient)
     elif args.flagMode == 'eval_ED':
         dataset_testing(evaluate_data_path=evaluate_data_path, model_dir=model_dir, loss_fn=args.lossType,
-                        # batch_size=args.batchSize,
                         batch_size=args.batchSize,
                         checkpoint_steps=args.checkpointSteps, deformable_range=args.deformableRange,
                         model_name=args.modelName,
                         loss_mask=args.lossMask, gpu_Number=args.gpuNumber, training_set=args.trainingSet,
                         image_shape=args.imageShape,
                         add_gradient=args.addGradient)
-    else:
+    else: # output mode
         dataset_output(result_path=output_dir,evaluate_data_path=evaluate_data_path, model_dir=model_dir, loss_fn=args.lossType,
                         batch_size=args.batchSize, checkpoint_steps=args.checkpointSteps, deformable_range = args.deformableRange,
                         model_name = args.modelName, loss_mask = args.lossMask, gpu_Number = args.gpuNumber, training_set = args.trainingSet,
