@@ -10,6 +10,7 @@ from module.activation import *
 from module.conv import conv
 from module.dfus_block import dfus_block_add_output_conv
 from module.utils import bilinear_warp, costvolumelayer
+from module.configs import load_yaml_config
 
 PI = 3.14159265358979323846
 flg = False
@@ -81,36 +82,57 @@ class ResidualChannelAttentionBlock(nn.Module):
         y = torch.sigmoid(y)
         
         return x + f * y
-
 class DepthResidualRegressionSubnet(nn.Module):
-    def __init__(self, subnet_num, flg=None, regular=None, batch_size=None, deformable_range=None):
+    def __init__(self, subnet_num,
+                 in_channels=None,
+                 n_filters=None,
+                 filter_sizes=None,
+                 config_path=None,
+                 flg=None, regular=None,
+                 batch_size=None,
+                 deformable_range=None):
         super(DepthResidualRegressionSubnet, self).__init__()
         self.pref = f'depth_regression_subnet_{subnet_num}_'
         
-        self.n_filters = [128, 96, 64, 32, 16, 1]
-        self.filter_sizes = [3] * len(self.n_filters)
+        # 默认参数
+        default_n_filters = [128, 96, 64, 32, 16, 1]
+        default_filter_sizes = [3] * len(default_n_filters)
+        default_in_channels = 208
+        
+        # 优先从config_path加载
+        config_n_filters = None
+        config_filter_sizes = None
+        config_in_channels = None
+        
+        if config_path is not None and os.path.isfile(config_path):
+            config = load_yaml_config(config_path)
+            cfg = config.get('depth_residual_regression', {})
+            config_n_filters = cfg.get('n_filters', None)
+            config_filter_sizes = cfg.get('filter_sizes', None)
+            config_in_channels = cfg.get('in_channels', None)
+        
+        # 赋值，优先使用传入参数，没有则用yaml中的，没有则用默认
+        self.n_filters = n_filters if n_filters is not None else (config_n_filters if config_n_filters is not None else default_n_filters)
+        self.filter_sizes = filter_sizes if filter_sizes is not None else (config_filter_sizes if config_filter_sizes is not None else default_filter_sizes)
+        self.in_channels = in_channels if in_channels is not None else (config_in_channels if config_in_channels is not None else default_in_channels)
         
         self.conv_layers = nn.ModuleList()
         for i in range(len(self.n_filters)):
-            in_channels = 128 if i == 0 else self.n_filters[i-1]
+            in_ch = self.in_channels if i == 0 else self.n_filters[i-1]
             self.conv_layers.append(
-                nn.Conv2d(in_channels, 
-                         self.n_filters[i],
-                         kernel_size=self.filter_sizes[i],
-                         padding=1)
+                nn.Conv2d(in_ch, self.n_filters[i], kernel_size=self.filter_sizes[i], padding=1)
             )
-        # 保留参数以兼容接口
+        
         self.flg = flg
         self.regular = regular
         self.batch_size = batch_size
         self.deformable_range = deformable_range
-            
+        
     def forward(self, x):
         current_input = x
-        for i in range(len(self.n_filters)-1):
+        for i in range(len(self.n_filters) - 1):
             current_input = self.conv_layers[i](current_input)
             current_input = F.relu(current_input)
-            
         current_input = self.conv_layers[-1](current_input)
         return current_input
 
@@ -124,7 +146,7 @@ class CorrFeatureRegressionSubnet(nn.Module):
         
         self.conv_layers = nn.ModuleList()
         for i in range(len(self.n_filters)):
-            in_channels = 128 if i == 0 else self.n_filters[i-1]
+            in_channels = 192 if i == 0 else self.n_filters[i-1]
             self.conv_layers.append(
                 nn.Conv2d(in_channels,
                          self.n_filters[i],
@@ -147,34 +169,30 @@ class CorrFeatureRegressionSubnet(nn.Module):
         return current_input
 
 class MaskRegressionSubnet(nn.Module):
-    def __init__(self, subnet_num, flg=None, regular=None, batch_size=None, deformable_range=None):
+    def __init__(self, subnet_num, in_channels=192, n_filters=[32, 1], filter_sizes=[3, 3],
+                 flg=None, regular=None, batch_size=None, deformable_range=None):
         super(MaskRegressionSubnet, self).__init__()
         self.pref = f'mask_regression_subnet_{subnet_num}_'
-        
-        self.n_filters = [32, 1]
-        self.filter_sizes = [3] * len(self.n_filters)
-        
+        self.n_filters = n_filters
+        self.filter_sizes = filter_sizes
+
         self.conv_layers = nn.ModuleList()
-        for i in range(len(self.n_filters)):
-            in_channels = 128 if i == 0 else self.n_filters[i-1]
+        for i in range(len(n_filters)):
+            in_ch = in_channels if i == 0 else n_filters[i-1]
             self.conv_layers.append(
-                nn.Conv2d(in_channels,
-                         self.n_filters[i],
-                         kernel_size=self.filter_sizes[i],
-                         padding=1)
+                nn.Conv2d(in_ch, n_filters[i], kernel_size=filter_sizes[i], padding=1)
             )
-        # 保留参数以兼容接口
+
         self.flg = flg
         self.regular = regular
         self.batch_size = batch_size
         self.deformable_range = deformable_range
-            
+
     def forward(self, x):
         current_input = x
         for i in range(len(self.n_filters)-1):
             current_input = self.conv_layers[i](current_input)
             current_input = F.relu(current_input)
-            
         current_input = self.conv_layers[-1](current_input)
         return current_input
 
@@ -183,7 +201,7 @@ class ResidualOutputSubnet(nn.Module):
         super(ResidualOutputSubnet, self).__init__()
         self.pref = f'residual_output_subnet_{subnet_num}_'
         
-        self.conv = nn.Conv2d(5, 1, kernel_size=1)
+        self.conv = nn.Conv2d(6, 1, kernel_size=1)
         # 保留参数以兼容接口
         self.flg = flg
         self.regular = regular
@@ -198,7 +216,7 @@ class DepthOutputSubnet(nn.Module):
         super(DepthOutputSubnet, self).__init__()
         self.pref = 'depth_output_subnet_'
         
-        self.conv = nn.Conv2d(64, kernel_size**2, kernel_size=1)
+        self.conv = nn.Conv2d(16, kernel_size**2, kernel_size=1)
         # 保留参数以兼容接口
         self.flg = flg
         self.regular = regular
@@ -242,70 +260,64 @@ class UNetSubnet(nn.Module):
         self.pool_strides = [1, 1, 2, 1, 2, 1, 2, 1]
         self.skips = [False, False, True, False, True, False, True, False]
         
-        # Encoder
-        self.encoder_conv = nn.ModuleList()
-        self.encoder_pool = nn.ModuleList()
-        
+        # Encoder convs
+        self.enc_convs = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        in_channels = 1
         for i in range(len(self.n_filters)):
-            in_channels = 2 if i == 0 else self.n_filters[i-1]
-            self.encoder_conv.append(
-                nn.Conv2d(in_channels,
-                         self.n_filters[i],
-                         kernel_size=self.filter_sizes[i],
-                         padding=1)
+            self.enc_convs.append(
+                nn.Conv2d(in_channels, self.n_filters[i], self.filter_sizes[i], padding=self.filter_sizes[i]//2)
             )
-            
-        # Decoder
-        self.decoder_conv = nn.ModuleList()
-        
-        for i in range(len(self.n_filters)-2, 0, -1):
-            if self.skips[i] and self.skips[i-1]:
-                in_channels = self.n_filters[i] + self.n_filters[i-1]
+            if self.pool_sizes[i] != 1 or self.pool_strides[i] != 1:
+                self.pools.append(nn.MaxPool2d(self.pool_sizes[i], self.pool_strides[i]))
             else:
-                in_channels = self.n_filters[i]
-                
-            self.decoder_conv.append(
-                nn.ConvTranspose2d(in_channels,
-                                 self.n_filters[i-1],
-                                 kernel_size=self.filter_sizes[i],
-                                 stride=self.pool_strides[i],
-                                 padding=1)
+                self.pools.append(None)
+            in_channels = self.n_filters[i]
+        # Decoder upconvs
+        self.upconvs = nn.ModuleList()
+        for i in range(len(self.n_filters)-2, 0, -1):
+            ksize = self.filter_sizes[i]
+            self.upconvs.append(
+                nn.ConvTranspose2d(self.n_filters[i+1], self.n_filters[i], ksize, stride=self.pool_strides[i], padding=ksize//2, output_padding=self.pool_strides[i]-1 if self.pool_strides[i]>1 else 0)
             )
         # 保留参数以兼容接口
         self.flg = flg
         self.regular = regular
         self.batch_size = batch_size
         self.deformable_range = deformable_range
-            
     def forward(self, x):
-        # Encoder
-        conv_outputs = []
-        pool_outputs = [x]
+        conv = []
+        pool = [x]
         current_input = x
-        
+        # Encoder
         for i in range(len(self.n_filters)):
-            current_input = self.encoder_conv[i](current_input)
-            current_input = F.relu(current_input)
-            
-            if self.pool_sizes[i] > 1:
-                current_input = F.max_pool2d(current_input,
-                                           kernel_size=self.pool_sizes[i],
-                                           stride=self.pool_strides[i])
-                
-            conv_outputs.append(current_input)
-            pool_outputs.append(current_input)
-            
+            current_input = self.enc_convs[i](pool[-1])
+            current_input = relu(current_input)
+            conv.append(current_input)
+            if self.pool_sizes[i] == 1 and self.pool_strides[i] == 1:
+                pool.append(current_input)
+            else:
+                pooled = self.pools[i](current_input)
+                pool.append(pooled)
+            current_input = pool[-1]
         # Decoder
-        current_input = pool_outputs[-1]
-        for i in range(len(self.decoder_conv)):
-            current_input = self.decoder_conv[i](current_input)
-            current_input = F.relu(current_input)
-            
-            if self.skips[i] and self.skips[i-1]:
-                current_input = torch.cat([current_input, pool_outputs[i+1]], dim=1)
-                
-        return current_input
-
+        upsamp = []
+        current_input = pool[-1]
+        up_idx = 0
+        for i in range(len(self.n_filters)-2, 0, -1):
+            current_input = self.upconvs[up_idx](current_input)
+            current_input = relu(current_input)
+            upsamp.append(current_input)
+            if self.skips[i] == False and self.skips[i+1] == True:
+                target_size = pool[i+1].shape[2:]  # 目标空间尺寸 (H, W)
+                current_input = F.interpolate(current_input, size=target_size, mode='bilinear', align_corners=False)
+                current_input = torch.cat([current_input, pool[i+1]], dim=1)
+                C_in = current_input.shape[1]  # 通道数
+                reduce_conv = nn.Conv2d(in_channels=C_in, out_channels=C_in // 2, kernel_size=1).to(current_input.device)
+                current_input = reduce_conv(current_input)
+            up_idx += 1
+        features = upsamp[-1]
+        return features
 class PyramidCorrMaskMultiFrameDenoising(nn.Module):
     def __init__(self, batch_size, deformable_range, flg=None, regular=None):
         super(PyramidCorrMaskMultiFrameDenoising, self).__init__()
@@ -315,7 +327,7 @@ class PyramidCorrMaskMultiFrameDenoising(nn.Module):
         
         # Feature extractors
         self.feature_extractor1 = FeatureExtractorSubnet(num=1, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range)
-        self.feature_extractor2 = FeatureExtractorSubnet(num=1, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range)
+        #self.feature_extractor2 = FeatureExtractorSubnet(num=1, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range)
         
         # Correlation feature regression
         self.corr_feature_regression = nn.ModuleList([
@@ -324,12 +336,29 @@ class PyramidCorrMaskMultiFrameDenoising(nn.Module):
         
         # Mask regression
         self.mask_regression = nn.ModuleList([
-            MaskRegressionSubnet(i, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range) for i in range(1, 6)
+            MaskRegressionSubnet(
+                i,
+                in_channels=load_yaml_config(f"mask_regression_{i}.yaml")['mask_regression']['in_channels'],
+                n_filters=load_yaml_config(f"mask_regression_{i}.yaml")['mask_regression']['n_filters'],
+                filter_sizes=load_yaml_config(f"mask_regression_{i}.yaml")['mask_regression']['filter_sizes'],
+                flg=flg, regular=regular,
+                batch_size=batch_size, deformable_range=deformable_range
+            )
+            for i in range(1, 7)
         ])
-        
-        # Depth residual regression
+
         self.depth_residual_regression = nn.ModuleList([
-            DepthResidualRegressionSubnet(i, flg=flg, regular=regular, batch_size=batch_size, deformable_range=deformable_range) for i in range(1, 6)
+            DepthResidualRegressionSubnet(
+                i,
+                in_channels=load_yaml_config(f"depth_residual_regression_{i}.yaml")['depth_residual_regression']['in_channels'],
+                n_filters=load_yaml_config(f"depth_residual_regression_{i}.yaml")['depth_residual_regression']['n_filters'],
+                filter_sizes=load_yaml_config(f"depth_residual_regression_{i}.yaml")['depth_residual_regression']['filter_sizes'],
+                flg=flg,
+                regular=regular,
+                batch_size=batch_size,
+                deformable_range=deformable_range
+            )
+            for i in range(1, 7)
         ])
         
         # Residual output
@@ -350,35 +379,34 @@ class PyramidCorrMaskMultiFrameDenoising(nn.Module):
         corr_feature_in_list = []
 
         # Extract depth and amplitude
-        print("x:", x.shape) 
-        depth = x[:, :, :, 0:1]
-        amplitude = x[:, :, :, 1:2]
-        depth_2 = x[:, :, :, 2:3]
-        amplitude_2 = x[:, :, :, 3:4]
-        print("depth shape:", depth.shape)  # 应该是[B, 2, H, W]
-        print("amplitude shape:", amplitude.shape)  # 可能是[B, 10, H, W]等
+         
+        depth = x[:, 0:1, :, :]
+        amplitude = x[:, 1:2, :, :]
+        #depth_2 = x[:, :, :, 2:3]
+        #amplitude_2 = x[:, :, :, 3:4]
 
         x1_input = torch.cat([depth, amplitude], dim=1)
-        x2_input = torch.cat([depth_2, amplitude_2], dim=1)
-        print("feature_extractor1 input shape:", x1_input.shape)  # 应该是[B, 2, H, W]
-
+        #x2_input = torch.cat([depth_2, amplitude_2], dim=1)
         
         # Extract features
         features1 = self.feature_extractor1(x1_input)
-        features2 = self.feature_extractor2(x2_input)
+        #features2 = self.feature_extractor2(x2_input)
 
         low_num = 2
         for i in range(1, len(features1) + 1):
             if i == 1:
-                cost = costvolumelayer(features1[len(features1)-i], features2[len(features1)-i], search_range=3)
-                cost_in = costvolumelayer(features1[len(features1)-i], features2[len(features1)-i], search_range=3)
+                #cost = costvolumelayer(features1[len(features1)-i], features2[len(features1)-i], search_range=3)
+                #cost_in = costvolumelayer(features1[len(features1)-i], features2[len(features1)-i], search_range=3)
                 feature_input = features1[len(features1)-i]
-                feature_input_2 = features2[len(features1)-i]
-                inputs = torch.cat([feature_input, cost_in], dim=1)
-                m_inputs = torch.cat([feature_input, feature_input_2, cost], dim=1)
+                zero_cost = torch.zeros_like(feature_input)
+                #feature_input_2 = features2[len(features1)-i]
+                #inputs = torch.cat([feature_input, zero_cost], dim=1)
+                #m_inputs = torch.cat([feature_input, zero_cost], dim=1)
+                inputs = feature_input
+                m_inputs = feature_input
             else:
                 feature_input = features1[len(features1)-i]
-                feature_input_2 = features2[len(features1)-i]
+                #feature_input_2 = features2[len(features1)-i]
                 
                 # Resize previous outputs
                 depth_coarse_input = F.interpolate(depth_residual[-1], 
@@ -397,17 +425,15 @@ class PyramidCorrMaskMultiFrameDenoising(nn.Module):
                                              size=(feature_input.shape[2], feature_input.shape[3]),
                                              mode='bicubic',
                                              align_corners=True)
-                
-                if i < low_num:
-                    cost = costvolumelayer(features1[len(features1)-i], features2[len(features2)-i], search_range=3)
-                    cost_in = costvolumelayer(features1[len(features1)-i], features2[len(features1)-i], search_range=3)
+                #if i < low_num:
+                    #cost = costvolumelayer(features1[len(features1)-i], features2[len(features2)-i], search_range=3)
+                    #cost_in = costvolumelayer(features1[len(features1)-i], features2[len(features1)-i], search_range=3)
                     
-                m_inputs = torch.cat([feature_input, feature_input_2, corr_feature, d_conf], dim=1)
+                m_inputs = torch.cat([feature_input, corr_feature, d_conf], dim=1)
                 inputs = torch.cat([feature_input, corr_feature_in, depth_coarse_input], dim=1)
-                
             if i < low_num:
                 corr_feature = self.corr_feature_regression[i-1](m_inputs)
-                corr_feature_in = self.corr_feature_regression[i-1](inputs) # Corrected index here from i to i-1
+                corr_feature_in = self.corr_feature_regression[i](inputs) # Corrected index here from i to i-1
                 corr_feature_list.append(corr_feature)
                 corr_feature_in_list.append(corr_feature_in)
             else:
@@ -418,13 +444,13 @@ class PyramidCorrMaskMultiFrameDenoising(nn.Module):
                     # This case needs to be handled based on where corr_feature and corr_feature_in originate in the TF code
                     pass # This branch needs careful review of TF code if it's hit
                 else:
-                    corr_feature = corr_feature_list[-1] # Use last generated if not updated
-                    corr_feature_in = corr_feature_in_list[-1] # Use last generated if not updated
+                    pass
+                    #corr_feature = corr_feature_list[-1] # Use last generated if not updated
+                    #corr_feature_in = corr_feature_in_list[-1] # Use last generated if not updated
 
             d_conf = self.mask_regression[i-1](m_inputs)
             d_conf = F.softmax(d_conf, dim=1)
             d_conf_list.append(d_conf)
-            
             inputs = torch.cat([inputs, corr_feature], dim=1)
             current_depth_residual = self.depth_residual_regression[i-1](inputs)
             current_depth_residual = current_depth_residual * d_conf
@@ -445,4 +471,5 @@ class PyramidCorrMaskMultiFrameDenoising(nn.Module):
         depth_residual_input.append(final_depth_output - current_final_depth_output)
         
         return final_depth_output, torch.cat(depth_residual_input, dim=1)
+    
     

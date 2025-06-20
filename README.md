@@ -17,8 +17,18 @@ This repository is a PyTorch reimplementation of the original code from [Recurre
 
 This project is under active development. 
 
+## Dataset Download
+
+The TFT3D dataset used in this project can be downloaded from the following link:
+https://drive.google.com/drive/folders/1XASaOfcp3TzQJ0A2fMaXex-0eihha0vg
+
+## Environment Setup
 ```bash
+conda create -n tof_denoising python=3.8 -y
+conda activate tof_denoising
 conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+pip install -r requirements.txt
+```
 
 ```bash
 python recurrent_tof_denoising_pytorch/pipe/start.py \
@@ -34,3 +44,6 @@ python recurrent_tof_denoising_pytorch/pipe/start.py \
   --addGradient sobel_gradient \
   -g 4 \
   -e 1200
+
+
+
