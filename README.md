@@ -16,3 +16,6 @@ This repository is a PyTorch reimplementation of the original code from [Recurre
 ## Usage
 
 This project is under active development. 
+
+```bash
+conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
