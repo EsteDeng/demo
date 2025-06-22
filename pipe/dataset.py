@@ -57,7 +57,7 @@ def colorize_img(value, vmin=None, vmax=None, cmap=None):
     value = (value - vmin) / (vmax - vmin)  # vmin..vmax
     
     # quantize
-    indices = torch.round(value[:, 0] * 255).long()
+    indices = torch.clamp(torch.round(value[:, 0] * 255).long(), 0, 255)
     
     # gather
     color_map = plt.cm.get_cmap(cmap if cmap is not None else 'gray')

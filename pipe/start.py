@@ -416,8 +416,7 @@ def dataset_testing(evaluate_data_path, model_dir, batch_size, checkpoint_steps,
     device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
     
     # Instantiate the model
-    model = get_network(name=model_name, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range).to(device)
-
+    model = get_network(name=model_name, flg=False, regular=0.1, batch_size=batch_size, deformable_range=deformable_range).to(device)   
     if gpu_Number > 1 and torch.cuda.device_count() >= gpu_Number:
         print(f"Using {gpu_Number} GPUs for DataParallel during testing.")
         model = nn.DataParallel(model, device_ids=list(range(gpu_Number)))
@@ -436,7 +435,7 @@ def dataset_testing(evaluate_data_path, model_dir, batch_size, checkpoint_steps,
         else:
             raise FileNotFoundError(f"No checkpoint found in {model_dir} for step {checkpoint_steps}")
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device)['model_state_dict'])
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True)['model_state_dict'])
     model.eval()
 
     eval_loader = get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
@@ -453,22 +452,21 @@ def dataset_testing(evaluate_data_path, model_dir, batch_size, checkpoint_steps,
         for eval_batch_idx, (features, labels) in enumerate(test_pbar):
             inputs, gt, final_loss_msk, depth_kinect, amplitude_kinect, rgb_kinect = process_inputs(features, labels, {'training_set': training_set, 'output_flg': False, 'loss_mask': loss_mask}, 'eval', device)
 
-            depth_outs, _ = model(inputs, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range)
-
+            depth_outs, depth_residual_every_scale = model(inputs)
             # Calculate loss
             if add_gradient == 'sobel_gradient':
                 loss_1 = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
                 loss_2 = get_supervised_loss('sobel_gradient', depth_outs * final_loss_msk, gt * final_loss_msk, final_loss_msk)
-                eval_loss = loss_1 + 10.0 * loss_2
+                eval_loss = loss_1 + 1.0 * loss_2
             else:
                 eval_loss = get_supervised_loss(loss_fn, depth_outs, gt, final_loss_msk)
             eval_loss_total += eval_loss.item()
 
             # Calculate metrics (same logic as in training)
             if training_set == 'tof_FT3':
-                depth_outs_m = depth_outs * 409.5
-                depth_kinect_m = depth_kinect * 409.5
-                gt_m = gt * 409.5
+                depth_outs_m = depth_outs 
+                depth_kinect_m = depth_kinect 
+                gt_m = gt 
                 ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs_m, depth_kinect_m, gt_m, final_loss_msk)
             elif training_set == 'RGBDD':
                 ori_mae, pre_mae, pre_mae_percent_25, pre_mae_percent_50, pre_mae_percent_75 = get_metrics_mae(depth_outs, depth_kinect, gt, final_loss_msk)
@@ -531,7 +529,7 @@ def dataset_output(result_path, evaluate_data_path, model_dir, batch_size, check
     device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
     
     # Instantiate the model
-    model = get_network(name=model_name, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range).to(device)
+    model = get_network(name=model_name, flg=False, regular=0.1, batch_size=batch_size, deformable_range=deformable_range).to(device)
 
     if gpu_Number > 1 and torch.cuda.device_count() >= gpu_Number:
         print(f"Using {gpu_Number} GPUs for DataParallel during output.")
@@ -550,7 +548,7 @@ def dataset_output(result_path, evaluate_data_path, model_dir, batch_size, check
         else:
             raise FileNotFoundError(f"No checkpoint found in {model_dir} for step {checkpoint_steps}")
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device)['model_state_dict'])
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True)['model_state_dict'])
     model.eval()
 
     output_loader = get_input_fn(training_set=training_set, filenames=evaluate_data_path, height=image_shape[0], width=image_shape[1],
@@ -568,7 +566,7 @@ def dataset_output(result_path, evaluate_data_path, model_dir, batch_size, check
             inputs, gt_ignored, loss_msk_ignored, depth_kinect, amplitude_kinect, rgb_kinect = \
                 process_inputs(features, labels, {'training_set': training_set, 'output_flg': True, 'loss_mask': loss_mask}, 'predict', device)
 
-            depth_outs, _ = model(inputs, flg=False, regular=0.1, batch_size=batch_size, range=deformable_range)
+            depth_outs, _ = model(inputs)
 
             all_depth_outs.append(depth_outs.cpu().numpy())
             all_depth_kinect.append(depth_kinect.cpu().numpy())
@@ -585,7 +583,6 @@ def dataset_output(result_path, evaluate_data_path, model_dir, batch_size, check
     pre_depths = np.concatenate(all_depth_outs, axis=0)
     input_depths = np.concatenate(all_depth_kinect, axis=0)
     amplitudes = np.concatenate(all_amplitude_kinect, axis=0)
-
     # Create output directories
     os.makedirs(result_path, exist_ok=True)
     pre_depth_dir = os.path.join(result_path, 'pre_depth')
@@ -611,29 +608,39 @@ def dataset_output(result_path, evaluate_data_path, model_dir, batch_size, check
         depth_input_png_path = os.path.join(depth_input_png_dir, str(i)+'.png')
         pre_depth_png_path = os.path.join(pre_depth_png_dir, str(i) + '.png')
         amplitude_png_path = os.path.join(amplitude_png_dir, str(i) + '.png')
-
+        
         pre_depth = np.squeeze(pre_depths[i])
         input_depth = np.squeeze(input_depths[i])
         amplitude = np.squeeze(amplitudes[i])
 
         # Convert to appropriate scale for saving as PNG
         # Assuming these are 0-1 normalized values, scaling to 0-255 for 8-bit PNG
-        input_depth_display = np.clip(input_depth * 100, 0, 255).astype(np.uint8)
-        pre_depth_display = np.clip(pre_depth * 100, 0, 255).astype(np.uint8)
-        amplitude_display = np.clip(amplitude * 255, 0, 255).astype(np.uint8)
 
-        # Ensure 2D for grayscale image saving
-        if input_depth_display.ndim == 3 and input_depth_display.shape[-1] == 1:
-            input_depth_display = input_depth_display.squeeze(-1)
-        if pre_depth_display.ndim == 3 and pre_depth_display.shape[-1] == 1:
-            pre_depth_display = pre_depth_display.squeeze(-1)
-        if amplitude_display.ndim == 3 and amplitude_display.shape[-1] == 1:
-            amplitude_display = amplitude_display.squeeze(-1)
-
-
-        Image.fromarray(input_depth_display, 'L').save(depth_input_png_path)
-        Image.fromarray(pre_depth_display, 'L').save(pre_depth_png_path)
-        Image.fromarray(amplitude_display, 'L').save(amplitude_png_path)
+        dtype = torch.float32
+        def to_colorized_png(np_array, save_path, cmap='jet'):
+            # 转成tensor，添加batch和channel维度
+            tensor = torch.from_numpy(np_array).unsqueeze(0).unsqueeze(0).float()  # [1,1,H,W]
+            print(tensor.min(), tensor.max())
+            # 调用colorize_img，得到彩色tensor [1,H,W,3]
+            colorized = colorize_img(tensor, cmap=cmap).squeeze(0)  # [H,W,3], float
+            # 转成uint8 numpy
+            colorized_uint8 = (colorized.numpy() * 255).astype(np.uint8)
+            # 保存彩色png
+            Image.fromarray(colorized_uint8).save(save_path)
+        # 归一化到0~1，避免colorize_img异常
+        def normalize_to_01(arr):
+            arr_min, arr_max = arr.min(), arr.max()
+            if arr_max - arr_min < 1e-6:
+                return np.zeros_like(arr)
+            return (arr - arr_min) / (arr_max - arr_min)
+        # 先归一化原始数据
+        input_depth_norm = normalize_to_01(input_depth)
+        pre_depth_norm = normalize_to_01(pre_depth)
+        amplitude_norm = normalize_to_01(amplitude)
+        # 用colorize_img转成彩色png保存
+        to_colorized_png(input_depth_norm, depth_input_png_path, cmap='jet')
+        to_colorized_png(pre_depth_norm, pre_depth_png_path, cmap='jet')
+        to_colorized_png(amplitude_norm, amplitude_png_path, cmap='viridis')  
 
         # Save raw float data
         pre_depth.astype(np.float32).tofile(pre_depth_path)
