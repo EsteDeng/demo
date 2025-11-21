@@ -31,12 +31,29 @@ pip install -r requirements.txt
 ```
 
 ```bash
+#训练
 python recurrent_tof_denoising_pytorch/pipe/start.py \
   -b 2 \
   -s 200000 \
-  -m sample_pyramid_add_kpn \
+  -m pyramid_corr_multi_frame_denoising \
   -p size384 \
   -k depth_kinect_with_gt_msk \
+  -l 0.0004 \
+  -t tof_FT3 \
+  -i 480 640 \
+  -o mean_l1 \
+  --addGradient sobel_gradient \
+  -g 4 \
+  -e 1200
+
+#测试
+python recurrent_tof_denoising_pytorch/pipe/start.py \
+  -b 2 \
+  -s 200000 \
+  -m pyramid_corr_multi_frame_denoising \
+  -p size384 \
+  -k depth_kinect_with_gt_msk \
+  -f output\
   -l 0.0004 \
   -t tof_FT3 \
   -i 480 640 \

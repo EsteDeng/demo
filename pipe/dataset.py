@@ -7,7 +7,7 @@ import scipy.io
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import os
-
+import torch.utils.data as data
 PI = 3.14159265358979323846
 flg = False
 dtype = torch.float32
@@ -414,18 +414,42 @@ def imgs_input_fn_deeptof(filenames, height, width, shuffle=False, repeat_count=
         loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     return loader
+import os
+import numpy as np
+import torch
+import torch.utils.data as data
+from torch.utils.data import DataLoader
+from PIL import Image
+import scipy.io
 
-class FT3Dataset(torch.utils.data.Dataset):
+# CROP_TOP, CROP_BOTTOM = 48, 48
+# CROP_LEFT, CROP_RIGHT = 64, 64
+
+CROP_TOP, CROP_BOTTOM = 0, 0
+CROP_LEFT, CROP_RIGHT = 0, 0
+
+def _center_crop_hw(arr):
+    if arr.ndim == 2:
+        return arr[CROP_TOP:-CROP_BOTTOM, CROP_LEFT:-CROP_RIGHT]
+    elif arr.ndim == 3:
+        return arr[CROP_TOP:-CROP_BOTTOM, CROP_LEFT:-CROP_RIGHT, :]
+    else:
+        raise ValueError(f"Unexpected ndim={arr.ndim}")
+
+class FT3Dataset(data.Dataset):
     def __init__(self, filenames, height, width, transform=None):
         self.filenames = filenames
         self.height = height
         self.width = width
-        self.transform = transform  # 预处理函数
-        
-        # 自动读取 filenames/list.txt 中的文件名
+        self.transform = transform
+
         list_path = os.path.join(filenames, 'list.txt')
         with open(list_path, 'r') as f:
             self.file_list = [line.strip() for line in f if line.strip()]
+
+        # 预先计算裁剪后的尺寸（用于占位张量）
+        self.Hc = max(1, self.height - CROP_TOP - CROP_BOTTOM)
+        self.Wc = max(1, self.width  - CROP_LEFT - CROP_RIGHT)
 
     def __len__(self):
         return len(self.file_list)
@@ -433,804 +457,823 @@ class FT3Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         name = self.file_list[idx]
 
-        # 1. 实测深度 noisy_depth.mat
+        # 1) noisy depth (必须)
         noisy_path = os.path.join(self.filenames, 'nToF', f'{name}_noisy_depth.mat')
-        noisy_data = scipy.io.loadmat(noisy_path)['ndepth']
-        noisy = torch.tensor(noisy_data, dtype=torch.float32).unsqueeze(-1)  # [H, W, 1]
+        if not os.path.exists(noisy_path):
+            raise FileNotFoundError(f"Missing noisy depth: {noisy_path}")
+        noisy_data = scipy.io.loadmat(noisy_path)['ndepth']  # [H,W] 或 [H,W,1]
+        if noisy_data.ndim == 3:
+            noisy_data = noisy_data[..., 0]
+        # noisy = _center_crop_hw(noisy_data).astype(np.float32)                  # [Hc,Wc]
+        noisy = noisy_data.astype(np.float32)
+        noisy_t = torch.from_numpy(noisy).unsqueeze(0)                           # [1,Hc,Wc]
 
-        # 2. 实测强度图
+        # 2) intensity (必须)
         intensity_path = os.path.join(self.filenames, 'nToF', f'{name}_noisy_intensity.png')
-        intensity_img = Image.open(intensity_path).convert('L').resize((self.width, self.height))
-        intensity = torch.tensor(np.array(intensity_img), dtype=torch.float32).unsqueeze(-1)  # [H, W, 1]
+        if not os.path.exists(intensity_path):
+            raise FileNotFoundError(f"Missing intensity: {intensity_path}")
+        inten_img = Image.open(intensity_path).convert('L').resize((self.width, self.height))
+        intensity = np.array(inten_img, dtype=np.float32)                        # [H,W]
+        # intensity = _center_crop_hw(intensity)
+        intensity = intensity.astype(np.float32)                                   # [Hc,Wc]
+        intensity_t = torch.from_numpy(intensity).unsqueeze(0)                   # [1,Hc,Wc]
 
-        # 3. RGB 图像
+        # 3) RGB（可缺省：缺就返回全 0，占位，确保键一致）
         rgb_path = os.path.join(self.filenames, 'gt_depth_rgb', f'{name}_rgb.png')
-        rgb_img = Image.open(rgb_path).convert('RGB').resize((self.width, self.height))
-        rgb_np = np.array(rgb_img, dtype=np.float32)
+        if os.path.exists(rgb_path):
+            rgb_img = Image.open(rgb_path).convert('RGB').resize((self.width, self.height))
+            rgb_np = np.array(rgb_img, dtype=np.float32)                         # [H,W,3]
+            for c in range(3):   # 每通道减均值（与你原逻辑一致）
+                rgb_np[:, :, c] -= np.mean(rgb_np[:, :, c])
+            rgb_np = _center_crop_hw(rgb_np)                                     # [Hc,Wc,3]
+            rgb_t = torch.from_numpy(rgb_np).permute(2, 0, 1) / 255.0            # [3,Hc,Wc]
+        else:
+            rgb_t = torch.zeros(3, self.Hc, self.Wc, dtype=torch.float32)        # [3,Hc,Wc]
 
-        # 中心化每个通道
-        for i in range(3):
-            rgb_np[:, :, i] -= np.mean(rgb_np[:, :, i])
-        rgb_np = rgb_np[48:-48, 64:-64, :]  # 裁剪
-        rgb = torch.tensor(rgb_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        # 4) conf（可缺省：缺就占位 0）
+        conf_path = os.path.join(self.filenames, 'gt_depth_rgb', f'{name}_gt_conf.mat')
+        if os.path.exists(conf_path):
+            conf_data = scipy.io.loadmat(conf_path)['conf']                      # [H,W] 或 [H,W,1]
+            if conf_data.ndim == 3:
+                conf_data = conf_data[..., 0]
+            conf = _center_crop_hw(conf_data).astype(np.float32)                 # [Hc,Wc]
+            conf_t = torch.from_numpy(conf).unsqueeze(0)                         # [1,Hc,Wc]
+        else:
+            conf_t = torch.zeros(1, self.Hc, self.Wc, dtype=torch.float32)       # [1,Hc,Wc]
 
-        # 4. 真值深度图
+        # 5) GT（可缺省：缺就占位 0；output 模式不会用）
         gt_path = os.path.join(self.filenames, 'gt_depth_rgb', f'{name}_gt_depth.mat')
-        gt_data = scipy.io.loadmat(gt_path)['gt_depth']
-        gt = torch.tensor(gt_data, dtype=torch.float32).unsqueeze(-1)  # [H, W, 1]
-        gt = gt[48:-48, 64:-64, :] * 2.0
+        if os.path.exists(gt_path):
+            gt_data = scipy.io.loadmat(gt_path)['gt_depth']                      # [H,W] 或 [H,W,1]
+            if gt_data.ndim == 3:
+                gt_data = gt_data[..., 0]
+            gt = _center_crop_hw(gt_data).astype(np.float32) * 2.0               # [Hc,Wc]
+            gt_t = torch.from_numpy(gt).unsqueeze(0)                             # [1,Hc,Wc]
+        else:
+            gt_t = torch.zeros(1, self.Hc, self.Wc, dtype=torch.float32)         # [1,Hc,Wc]
 
-        noisy = noisy[48:-48, 64:-64, :]
-        intensity = intensity[48:-48, 64:-64, :] 
         features = {
-            'noisy': noisy.permute(2, 0, 1),
-            'intensity': intensity.permute(2, 0, 1),
-            'rgb': rgb
+            'noisy': noisy_t,           # [1,Hc,Wc]
+            'intensity': intensity_t,   # [1,Hc,Wc]
+            'rgb': rgb_t,               # [3,Hc,Wc]（可能是占位）
+            'conf': conf_t              # [1,Hc,Wc]（可能是占位）
         }
-        labels = {
-            'gt': gt.permute(2, 0, 1)
-        }
+        labels = {'gt': gt_t}           # [1,Hc,Wc]（可能是占位）
 
         return features, labels
 
 def imgs_input_fn_FT3(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    """
-    构建 ToFFlyingThings3D 的 DataLoader。file_list 自动从 filenames/list.txt 读取。
-    """
     dataset = FT3Dataset(
         filenames=filenames,
         height=height,
         width=width,
-        transform=None  # 可根据需要传入 transform
+        transform=None
     )
-
-    dataloader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if 4 > 0 else False
     )
 
-    return dataloader
-
-
-class FT3DualFrameDataset(torch.utils.data.Dataset):
-    def __init__(self, filenames, height, width, transform=None):
-        self.height = height
-        self.width = width
-        self.transform = transform
-
-        self.description = {
-            'noisy': 'byte',
-            'intensity': 'byte',
-            'rgb': 'byte',
-            'gt': 'byte',
-            'noisy_2': 'byte',
-            'intensity_2': 'byte',
-            'rgb_2': 'byte',
-            'gt_2': 'byte'
-        }
-
-        self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        example = self.dataset[idx]
-
-        def decode(key, channels):
-            return np.frombuffer(example[key], dtype=np.float32).reshape(self.height, self.width, channels)
-
-        noisy = decode('noisy', 1)
-        intensity = decode('intensity', 1)
-        rgb = decode('rgb', 3)
-        gt = decode('gt', 1)
-
-        noisy_2 = decode('noisy_2', 1)
-        intensity_2 = decode('intensity_2', 1)
-        rgb_2 = decode('rgb_2', 3)
-        gt_2 = decode('gt_2', 1)
-
-        features = {
-            'noisy': torch.from_numpy(noisy).float(),
-            'intensity': torch.from_numpy(intensity).float(),
-            'rgb': torch.from_numpy(rgb).float(),
-            'noisy_2': torch.from_numpy(noisy_2).float(),
-            'intensity_2': torch.from_numpy(intensity_2).float(),
-            'rgb_2': torch.from_numpy(rgb_2).float()
-        }
-
-        labels = {
-            'gt': torch.from_numpy(gt).float(),
-            'gt_2': torch.from_numpy(gt_2).float()
-        }
-
-        if self.transform:
-            features, labels = self.transform(features, labels)
-
-        return features, labels
-
-def imgs_input_fn_FT3_2F(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    dataset = FT3DualFrameDataset(filenames, height, width, transform=preprocessing_tof_FT3D2F)
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle
-    )
-
-    return dataloader
-
-class FT3_2F_T3_Dataset(Dataset):
-    def __init__(self, filenames, height, width, transform=None):
-        self.filenames = filenames
-        self.height = height
-        self.width = width
-        self.transform = transform
-
-        self.description = {
-            "noisy": "byte",
-            "intensity": "byte",
-            "gt": "byte",
-            "noisy_2": "byte",
-            "intensity_2": "byte",
-        }
-
-        self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        sample = self.dataset[idx]
-
-        H, W = self.height, self.width
-
-        def decode_and_reshape(key, channels=1):
-            array = np.frombuffer(sample[key], dtype=np.float32)
-            return torch.from_numpy(array).view(H, W, channels)
-
-        features = {
-            'noisy': decode_and_reshape("noisy", 1),
-            'intensity': decode_and_reshape("intensity", 1),
-            'noisy_2': decode_and_reshape("noisy_2", 1),
-            'intensity_2': decode_and_reshape("intensity_2", 1),
-        }
-
-        labels = {
-            'gt': decode_and_reshape("gt", 1)
-        }
-
-        if self.transform:
-            features, labels = self.transform(features, labels)
-
-        return features, labels
-
-def imgs_input_fn_FT3_2F_T3(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    dataset = FT3_2F_T3_Dataset(
-        filenames=filenames,
-        height=height,
-        width=width,
-        transform=preprocessing_tof_FT3D2F_T3
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-        drop_last=True
-    )
-
-    return loader
-
-class HAMMERDataset(Dataset):
-    def __init__(self, filenames, height, width, transform=None):
-        self.height = height
-        self.width = width
-        self.transform = transform
-
-        self.description = {
-            'noisy': 'byte',
-            'intensity': 'byte',
-            'gt': 'byte',
-            'noisy_2': 'byte',
-            'intensity_2': 'byte',
-        }
-
-        self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        example = self.dataset[idx]
-        H, W = self.height, self.width
-
-        def decode_and_reshape(key, channels=1):
-            data = np.frombuffer(example[key], dtype=np.float32)
-            return torch.from_numpy(data).view(H, W, channels)
-
-        features = {
-            'noisy': decode_and_reshape('noisy'),
-            'intensity': decode_and_reshape('intensity'),
-            'noisy_2': decode_and_reshape('noisy_2'),
-            'intensity_2': decode_and_reshape('intensity_2'),
-        }
-
-        labels = {
-            'gt': decode_and_reshape('gt')
-        }
-
-        if self.transform:
-            features, labels = self.transform(features, labels)
-
-        return features, labels
-
-def imgs_input_fn_HAMMER(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    dataset = HAMMERDataset(
-        filenames=filenames,
-        height=height,
-        width=width,
-        transform=preprocessing_tof_HAMMER
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-        drop_last=True
-    )
-
-    return dataloader
-
-class CornellBoxDataset(Dataset):
-    def __init__(self, filenames, height, width, transform=None):
-        self.height = height
-        self.width = width
-        self.transform = transform
-
-        self.description = {
-            'noisy_20MHz': 'byte',
-            'amplitude_20MHz': 'byte',
-            'noisy_50MHz': 'byte',
-            'amplitude_50MHz': 'byte',
-            'noisy_70MHz': 'byte',
-            'amplitude_70MHz': 'byte',
-            'gt': 'byte'
-        }
-
-        self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        example = self.dataset[idx]
-        H, W = self.height, self.width
-
-        def decode(key, channels=1):
-            return torch.from_numpy(
-                np.frombuffer(example[key], dtype=np.float32).reshape(H, W, channels)
-            )
-
-        # Load and stack noisy channels
-        noisy = torch.cat([
-            decode('noisy_20MHz'),
-            decode('noisy_50MHz'),
-            decode('noisy_70MHz')
-        ], dim=-1)  # (H, W, 3)
-
-        # Load and stack amplitude channels
-        amplitude = torch.cat([
-            decode('amplitude_20MHz'),
-            decode('amplitude_50MHz'),
-            decode('amplitude_70MHz')
-        ], dim=-1)  # (H, W, 3)
-
-        gt = decode('gt')  # (H, W, 1)
-
-        features = {'noisy': noisy, 'amplitude': amplitude}
-        labels = {'gt': gt}
-
-        if self.transform:
-            features, labels = self.transform(features, labels)
-
-        return features, labels
-
-def imgs_input_fn_cornellbox(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    dataset = CornellBoxDataset(
-        filenames=filenames,
-        height=height,
-        width=width,
-        transform=preprocessing_cornellbox  # your preprocessing function
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-        drop_last=True
-    )
-
-    return dataloader
-
-class CornellBox2FDataset(Dataset):
-    def __init__(self, filenames, height, width, transform=None):
-        self.height = height
-        self.width = width
-        self.transform = transform
-
-        self.description = {
-            'noisy_20MHz': 'byte',
-            'amplitude_20MHz': 'byte',
-            'noisy_50MHz': 'byte',
-            'amplitude_50MHz': 'byte',
-            'noisy_70MHz': 'byte',
-            'amplitude_70MHz': 'byte',
-            'gt': 'byte',
-            'noisy_2_20MHz': 'byte',
-            'amplitude_2_20MHz': 'byte',
-            'noisy_2_50MHz': 'byte',
-            'amplitude_2_50MHz': 'byte',
-            'noisy_2_70MHz': 'byte',
-            'amplitude_2_70MHz': 'byte',
-            # 'gt_2': 'byte',  # 可选
-        }
-
-        self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        example = self.dataset[idx]
-        H, W = self.height, self.width
-
-        def decode(key, channels=1):
-            return torch.from_numpy(
-                np.frombuffer(example[key], dtype=np.float32).reshape(H, W, channels)
-            )
-
-        # 第一帧 noisy + amplitude
-        noisy = torch.cat([
-            decode('noisy_20MHz'),
-            decode('noisy_50MHz'),
-            decode('noisy_70MHz')
-        ], dim=-1)  # (H, W, 3)
-
-        amplitude = torch.cat([
-            decode('amplitude_20MHz'),
-            decode('amplitude_50MHz'),
-            decode('amplitude_70MHz')
-        ], dim=-1)  # (H, W, 3)
-
-        # 第二帧 noisy_2 + amplitude_2
-        noisy_2 = torch.cat([
-            decode('noisy_2_20MHz'),
-            decode('noisy_2_50MHz'),
-            decode('noisy_2_70MHz')
-        ], dim=-1)  # (H, W, 3)
-
-        amplitude_2 = torch.cat([
-            decode('amplitude_2_20MHz'),
-            decode('amplitude_2_50MHz'),
-            decode('amplitude_2_70MHz')
-        ], dim=-1)  # (H, W, 3)
-
-        # Ground truth
-        gt = decode('gt')  # (H, W, 1)
-
-        features = {
-            'noisy': noisy,
-            'amplitude': amplitude,
-            'noisy_2': noisy_2,
-            'amplitude_2': amplitude_2
-        }
-
-        labels = {'gt': gt}
-
-        if self.transform:
-            features, labels = self.transform(features, labels)
-
-        return features, labels
-
-def imgs_input_fn_cornellbox_2F(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    dataset = CornellBox2FDataset(
-        filenames=filenames,
-        height=height,
-        width=width,
-        transform=preprocessing_cornellbox_2F  # 注意调用的是 _2F 版本
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-        drop_last=True
-    )
-
-    return dataloader
-
-def imgs_input_fn_cornellbox_SN(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    """Create input function for CornellBox SN dataset"""
-    def _parse_function(serialized, height=height, width=width):
-        features = {
-            'noisy_50MHz': torch.FixedLenFeature([], torch.string),
-            'amplitude_50MHz': torch.FixedLenFeature([], torch.string),
-            'gt': torch.FixedLenFeature([], torch.string),
-            'noisy_2_50MHz': torch.FixedLenFeature([], torch.string),
-            'amplitude_2_50MHz': torch.FixedLenFeature([], torch.string)
-        }
+# class FT3DualFrameDataset(torch.utils.data.Dataset):
+#     def __init__(self, filenames, height, width, transform=None):
+#         self.height = height
+#         self.width = width
+#         self.transform = transform
+
+#         self.description = {
+#             'noisy': 'byte',
+#             'intensity': 'byte',
+#             'rgb': 'byte',
+#             'gt': 'byte',
+#             'noisy_2': 'byte',
+#             'intensity_2': 'byte',
+#             'rgb_2': 'byte',
+#             'gt_2': 'byte'
+#         }
+
+#         self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
+
+#     def __len__(self):
+#         return len(self.dataset)
+
+#     def __getitem__(self, idx):
+#         example = self.dataset[idx]
+
+#         def decode(key, channels):
+#             return np.frombuffer(example[key], dtype=np.float32).reshape(self.height, self.width, channels)
+
+#         noisy = decode('noisy', 1)
+#         intensity = decode('intensity', 1)
+#         rgb = decode('rgb', 3)
+#         gt = decode('gt', 1)
+
+#         noisy_2 = decode('noisy_2', 1)
+#         intensity_2 = decode('intensity_2', 1)
+#         rgb_2 = decode('rgb_2', 3)
+#         gt_2 = decode('gt_2', 1)
+
+#         features = {
+#             'noisy': torch.from_numpy(noisy).float(),
+#             'intensity': torch.from_numpy(intensity).float(),
+#             'rgb': torch.from_numpy(rgb).float(),
+#             'noisy_2': torch.from_numpy(noisy_2).float(),
+#             'intensity_2': torch.from_numpy(intensity_2).float(),
+#             'rgb_2': torch.from_numpy(rgb_2).float()
+#         }
+
+#         labels = {
+#             'gt': torch.from_numpy(gt).float(),
+#             'gt_2': torch.from_numpy(gt_2).float()
+#         }
+
+#         if self.transform:
+#             features, labels = self.transform(features, labels)
+
+#         return features, labels
+
+# def imgs_input_fn_FT3_2F(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     dataset = FT3DualFrameDataset(filenames, height, width, transform=preprocessing_tof_FT3D2F)
+
+#     dataloader = torch.utils.data.DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=shuffle
+#     )
+
+#     return dataloader
+
+# class FT3_2F_T3_Dataset(Dataset):
+#     def __init__(self, filenames, height, width, transform=None):
+#         self.filenames = filenames
+#         self.height = height
+#         self.width = width
+#         self.transform = transform
+
+#         self.description = {
+#             "noisy": "byte",
+#             "intensity": "byte",
+#             "gt": "byte",
+#             "noisy_2": "byte",
+#             "intensity_2": "byte",
+#         }
+
+#         self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
+
+#     def __len__(self):
+#         return len(self.dataset)
+
+#     def __getitem__(self, idx):
+#         sample = self.dataset[idx]
+
+#         H, W = self.height, self.width
+
+#         def decode_and_reshape(key, channels=1):
+#             array = np.frombuffer(sample[key], dtype=np.float32)
+#             return torch.from_numpy(array).view(H, W, channels)
+
+#         features = {
+#             'noisy': decode_and_reshape("noisy", 1),
+#             'intensity': decode_and_reshape("intensity", 1),
+#             'noisy_2': decode_and_reshape("noisy_2", 1),
+#             'intensity_2': decode_and_reshape("intensity_2", 1),
+#         }
+
+#         labels = {
+#             'gt': decode_and_reshape("gt", 1)
+#         }
+
+#         if self.transform:
+#             features, labels = self.transform(features, labels)
+
+#         return features, labels
+
+# def imgs_input_fn_FT3_2F_T3(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     dataset = FT3_2F_T3_Dataset(
+#         filenames=filenames,
+#         height=height,
+#         width=width,
+#         transform=preprocessing_tof_FT3D2F_T3
+#     )
+
+#     loader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=shuffle,
+#         num_workers=0,
+#         drop_last=True
+#     )
+
+#     return loader
+
+# class HAMMERDataset(Dataset):
+#     def __init__(self, filenames, height, width, transform=None):
+#         self.height = height
+#         self.width = width
+#         self.transform = transform
+
+#         self.description = {
+#             'noisy': 'byte',
+#             'intensity': 'byte',
+#             'gt': 'byte',
+#             'noisy_2': 'byte',
+#             'intensity_2': 'byte',
+#         }
+
+#         self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
+
+#     def __len__(self):
+#         return len(self.dataset)
+
+#     def __getitem__(self, idx):
+#         example = self.dataset[idx]
+#         H, W = self.height, self.width
+
+#         def decode_and_reshape(key, channels=1):
+#             data = np.frombuffer(example[key], dtype=np.float32)
+#             return torch.from_numpy(data).view(H, W, channels)
+
+#         features = {
+#             'noisy': decode_and_reshape('noisy'),
+#             'intensity': decode_and_reshape('intensity'),
+#             'noisy_2': decode_and_reshape('noisy_2'),
+#             'intensity_2': decode_and_reshape('intensity_2'),
+#         }
+
+#         labels = {
+#             'gt': decode_and_reshape('gt')
+#         }
+
+#         if self.transform:
+#             features, labels = self.transform(features, labels)
+
+#         return features, labels
+
+# def imgs_input_fn_HAMMER(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     dataset = HAMMERDataset(
+#         filenames=filenames,
+#         height=height,
+#         width=width,
+#         transform=preprocessing_tof_HAMMER
+#     )
+
+#     dataloader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=shuffle,
+#         num_workers=0,
+#         drop_last=True
+#     )
+
+#     return dataloader
+
+# class CornellBoxDataset(Dataset):
+#     def __init__(self, filenames, height, width, transform=None):
+#         self.height = height
+#         self.width = width
+#         self.transform = transform
+
+#         self.description = {
+#             'noisy_20MHz': 'byte',
+#             'amplitude_20MHz': 'byte',
+#             'noisy_50MHz': 'byte',
+#             'amplitude_50MHz': 'byte',
+#             'noisy_70MHz': 'byte',
+#             'amplitude_70MHz': 'byte',
+#             'gt': 'byte'
+#         }
+
+#         self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
+
+#     def __len__(self):
+#         return len(self.dataset)
+
+#     def __getitem__(self, idx):
+#         example = self.dataset[idx]
+#         H, W = self.height, self.width
+
+#         def decode(key, channels=1):
+#             return torch.from_numpy(
+#                 np.frombuffer(example[key], dtype=np.float32).reshape(H, W, channels)
+#             )
+
+#         # Load and stack noisy channels
+#         noisy = torch.cat([
+#             decode('noisy_20MHz'),
+#             decode('noisy_50MHz'),
+#             decode('noisy_70MHz')
+#         ], dim=-1)  # (H, W, 3)
+
+#         # Load and stack amplitude channels
+#         amplitude = torch.cat([
+#             decode('amplitude_20MHz'),
+#             decode('amplitude_50MHz'),
+#             decode('amplitude_70MHz')
+#         ], dim=-1)  # (H, W, 3)
+
+#         gt = decode('gt')  # (H, W, 1)
+
+#         features = {'noisy': noisy, 'amplitude': amplitude}
+#         labels = {'gt': gt}
+
+#         if self.transform:
+#             features, labels = self.transform(features, labels)
+
+#         return features, labels
+
+# def imgs_input_fn_cornellbox(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     dataset = CornellBoxDataset(
+#         filenames=filenames,
+#         height=height,
+#         width=width,
+#         transform=preprocessing_cornellbox  # your preprocessing function
+#     )
+
+#     dataloader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=shuffle,
+#         num_workers=0,
+#         drop_last=True
+#     )
+
+#     return dataloader
+
+# class CornellBox2FDataset(Dataset):
+#     def __init__(self, filenames, height, width, transform=None):
+#         self.height = height
+#         self.width = width
+#         self.transform = transform
+
+#         self.description = {
+#             'noisy_20MHz': 'byte',
+#             'amplitude_20MHz': 'byte',
+#             'noisy_50MHz': 'byte',
+#             'amplitude_50MHz': 'byte',
+#             'noisy_70MHz': 'byte',
+#             'amplitude_70MHz': 'byte',
+#             'gt': 'byte',
+#             'noisy_2_20MHz': 'byte',
+#             'amplitude_2_20MHz': 'byte',
+#             'noisy_2_50MHz': 'byte',
+#             'amplitude_2_50MHz': 'byte',
+#             'noisy_2_70MHz': 'byte',
+#             'amplitude_2_70MHz': 'byte',
+#             # 'gt_2': 'byte',  # 可选
+#         }
+
+#         self.dataset = TFRecordDataset(filenames, index_path=None, description=self.description)
+
+#     def __len__(self):
+#         return len(self.dataset)
+
+#     def __getitem__(self, idx):
+#         example = self.dataset[idx]
+#         H, W = self.height, self.width
+
+#         def decode(key, channels=1):
+#             return torch.from_numpy(
+#                 np.frombuffer(example[key], dtype=np.float32).reshape(H, W, channels)
+#             )
+
+#         # 第一帧 noisy + amplitude
+#         noisy = torch.cat([
+#             decode('noisy_20MHz'),
+#             decode('noisy_50MHz'),
+#             decode('noisy_70MHz')
+#         ], dim=-1)  # (H, W, 3)
+
+#         amplitude = torch.cat([
+#             decode('amplitude_20MHz'),
+#             decode('amplitude_50MHz'),
+#             decode('amplitude_70MHz')
+#         ], dim=-1)  # (H, W, 3)
+
+#         # 第二帧 noisy_2 + amplitude_2
+#         noisy_2 = torch.cat([
+#             decode('noisy_2_20MHz'),
+#             decode('noisy_2_50MHz'),
+#             decode('noisy_2_70MHz')
+#         ], dim=-1)  # (H, W, 3)
+
+#         amplitude_2 = torch.cat([
+#             decode('amplitude_2_20MHz'),
+#             decode('amplitude_2_50MHz'),
+#             decode('amplitude_2_70MHz')
+#         ], dim=-1)  # (H, W, 3)
+
+#         # Ground truth
+#         gt = decode('gt')  # (H, W, 1)
+
+#         features = {
+#             'noisy': noisy,
+#             'amplitude': amplitude,
+#             'noisy_2': noisy_2,
+#             'amplitude_2': amplitude_2
+#         }
+
+#         labels = {'gt': gt}
+
+#         if self.transform:
+#             features, labels = self.transform(features, labels)
+
+#         return features, labels
+
+# def imgs_input_fn_cornellbox_2F(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     dataset = CornellBox2FDataset(
+#         filenames=filenames,
+#         height=height,
+#         width=width,
+#         transform=preprocessing_cornellbox_2F  # 注意调用的是 _2F 版本
+#     )
+
+#     dataloader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=shuffle,
+#         num_workers=0,
+#         drop_last=True
+#     )
+
+#     return dataloader
+
+# def imgs_input_fn_cornellbox_SN(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     """Create input function for CornellBox SN dataset"""
+#     def _parse_function(serialized, height=height, width=width):
+#         features = {
+#             'noisy_50MHz': torch.FixedLenFeature([], torch.string),
+#             'amplitude_50MHz': torch.FixedLenFeature([], torch.string),
+#             'gt': torch.FixedLenFeature([], torch.string),
+#             'noisy_2_50MHz': torch.FixedLenFeature([], torch.string),
+#             'amplitude_2_50MHz': torch.FixedLenFeature([], torch.string)
+#         }
         
-        parsed_example = torch.parse_single_example(serialized=serialized, features=features)
+#         parsed_example = torch.parse_single_example(serialized=serialized, features=features)
         
-        noisy_shape = torch.tensor([height, width, 1])
-        intensity_shape = torch.tensor([height, width, 1])
-        gt_shape = torch.tensor([height, width, 1])
+#         noisy_shape = torch.tensor([height, width, 1])
+#         intensity_shape = torch.tensor([height, width, 1])
+#         gt_shape = torch.tensor([height, width, 1])
         
-        noisy_20MHz_raw = parsed_example['noisy_50MHz']
-        amplitude_20MHz_raw = parsed_example['amplitude_50MHz']
-        gt_raw = parsed_example['gt']
-        noisy_20MHz_raw_2 = parsed_example['noisy_2_50MHz']
-        amplitude_20MHz_raw_2 = parsed_example['amplitude_2_50MHz']
+#         noisy_20MHz_raw = parsed_example['noisy_50MHz']
+#         amplitude_20MHz_raw = parsed_example['amplitude_50MHz']
+#         gt_raw = parsed_example['gt']
+#         noisy_20MHz_raw_2 = parsed_example['noisy_2_50MHz']
+#         amplitude_20MHz_raw_2 = parsed_example['amplitude_2_50MHz']
         
-        # Decode the raw bytes
-        noisy_20MHz = torch.decode_raw(noisy_20MHz_raw, torch.float32)
-        noisy_20MHz = noisy_20MHz.float()
-        noisy_20MHz = noisy_20MHz.view(noisy_shape)
+#         # Decode the raw bytes
+#         noisy_20MHz = torch.decode_raw(noisy_20MHz_raw, torch.float32)
+#         noisy_20MHz = noisy_20MHz.float()
+#         noisy_20MHz = noisy_20MHz.view(noisy_shape)
         
-        amplitude_20MHz = torch.decode_raw(amplitude_20MHz_raw, torch.float32)
-        amplitude_20MHz = amplitude_20MHz.float()
-        amplitude_20MHz = amplitude_20MHz.view(intensity_shape)
+#         amplitude_20MHz = torch.decode_raw(amplitude_20MHz_raw, torch.float32)
+#         amplitude_20MHz = amplitude_20MHz.float()
+#         amplitude_20MHz = amplitude_20MHz.view(intensity_shape)
         
-        gt = torch.decode_raw(gt_raw, torch.float32)
-        gt = gt.float()
-        gt = gt.view(gt_shape)
+#         gt = torch.decode_raw(gt_raw, torch.float32)
+#         gt = gt.float()
+#         gt = gt.view(gt_shape)
         
-        noisy_20MHz_2 = torch.decode_raw(noisy_20MHz_raw_2, torch.float32)
-        noisy_20MHz_2 = noisy_20MHz_2.float()
-        noisy_20MHz_2 = noisy_20MHz_2.view(noisy_shape)
+#         noisy_20MHz_2 = torch.decode_raw(noisy_20MHz_raw_2, torch.float32)
+#         noisy_20MHz_2 = noisy_20MHz_2.float()
+#         noisy_20MHz_2 = noisy_20MHz_2.view(noisy_shape)
         
-        amplitude_20MHz_2 = torch.decode_raw(amplitude_20MHz_raw_2, torch.float32)
-        amplitude_20MHz_2 = amplitude_20MHz_2.float()
-        amplitude_20MHz_2 = amplitude_20MHz_2.view(intensity_shape)
+#         amplitude_20MHz_2 = torch.decode_raw(amplitude_20MHz_raw_2, torch.float32)
+#         amplitude_20MHz_2 = amplitude_20MHz_2.float()
+#         amplitude_20MHz_2 = amplitude_20MHz_2.view(intensity_shape)
         
-        noisy = noisy_20MHz
-        amplitude = amplitude_20MHz
-        noisy_2 = noisy_20MHz_2
-        amplitude_2 = amplitude_20MHz_2
+#         noisy = noisy_20MHz
+#         amplitude = amplitude_20MHz
+#         noisy_2 = noisy_20MHz_2
+#         amplitude_2 = amplitude_20MHz_2
         
-        features = {
-            'noisy': noisy, 'amplitude': amplitude,
-            'noisy_2': noisy_2, 'amplitude_2': amplitude_2
-        }
-        labels = {'gt': gt}
+#         features = {
+#             'noisy': noisy, 'amplitude': amplitude,
+#             'noisy_2': noisy_2, 'amplitude_2': amplitude_2
+#         }
+#         labels = {'gt': gt}
         
-        return features, labels
+#         return features, labels
     
-    dataset = torch.data.TFRecordDataset(filenames=filenames)
-    dataset = dataset.map(_parse_function)
-    dataset = dataset.map(
-        lambda features, labels: preprocessing_tof_HAMMER(features, labels)
-    )
+#     dataset = torch.data.TFRecordDataset(filenames=filenames)
+#     dataset = dataset.map(_parse_function)
+#     dataset = dataset.map(
+#         lambda features, labels: preprocessing_tof_HAMMER(features, labels)
+#     )
     
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=256)
+#     if shuffle:
+#         dataset = dataset.shuffle(buffer_size=256)
     
-    dataset = dataset.repeat(repeat_count)
-    batch_dataset = dataset.batch(batch_size)
-    batch_dataset = batch_dataset.prefetch(2)
+#     dataset = dataset.repeat(repeat_count)
+#     batch_dataset = dataset.batch(batch_size)
+#     batch_dataset = batch_dataset.prefetch(2)
     
-    return batch_dataset
+#     return batch_dataset
 
-def imgs_input_fn_Agresti_S1(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    """Create input function for Agresti S1 dataset"""
-    def _parse_function(serialized, height=height, width=width):
-        features = {
-            'noisy': torch.FixedLenFeature([], torch.string),
-            'intensity': torch.FixedLenFeature([], torch.string),
-            'amplitude': torch.FixedLenFeature([], torch.string),
-            'gt': torch.FixedLenFeature([], torch.string)
-        }
+# def imgs_input_fn_Agresti_S1(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     """Create input function for Agresti S1 dataset"""
+#     def _parse_function(serialized, height=height, width=width):
+#         features = {
+#             'noisy': torch.FixedLenFeature([], torch.string),
+#             'intensity': torch.FixedLenFeature([], torch.string),
+#             'amplitude': torch.FixedLenFeature([], torch.string),
+#             'gt': torch.FixedLenFeature([], torch.string)
+#         }
         
-        parsed_example = torch.parse_single_example(serialized=serialized, features=features)
+#         parsed_example = torch.parse_single_example(serialized=serialized, features=features)
         
-        noisy_shape = torch.tensor([height, width, 3])
-        intensity_shape = torch.tensor([height, width, 3])
-        amplitude_shape = torch.tensor([height, width, 3])
-        gt_shape = torch.tensor([height, width, 1])
+#         noisy_shape = torch.tensor([height, width, 3])
+#         intensity_shape = torch.tensor([height, width, 3])
+#         amplitude_shape = torch.tensor([height, width, 3])
+#         gt_shape = torch.tensor([height, width, 1])
         
-        noisy_raw = parsed_example['noisy']
-        intensity_raw = parsed_example['intensity']
-        amplitude_raw = parsed_example['amplitude']
-        gt_raw = parsed_example['gt']
+#         noisy_raw = parsed_example['noisy']
+#         intensity_raw = parsed_example['intensity']
+#         amplitude_raw = parsed_example['amplitude']
+#         gt_raw = parsed_example['gt']
         
-        # Decode the raw bytes
-        noisy = torch.decode_raw(noisy_raw, torch.float32)
-        noisy = noisy.float()
-        noisy = noisy.view(noisy_shape)
+#         # Decode the raw bytes
+#         noisy = torch.decode_raw(noisy_raw, torch.float32)
+#         noisy = noisy.float()
+#         noisy = noisy.view(noisy_shape)
         
-        intensity = torch.decode_raw(intensity_raw, torch.float32)
-        intensity = intensity.float()
-        intensity = intensity.view(intensity_shape)
+#         intensity = torch.decode_raw(intensity_raw, torch.float32)
+#         intensity = intensity.float()
+#         intensity = intensity.view(intensity_shape)
         
-        amplitude = torch.decode_raw(amplitude_raw, torch.float32)
-        amplitude = amplitude.float()
-        amplitude = amplitude.view(amplitude_shape)
+#         amplitude = torch.decode_raw(amplitude_raw, torch.float32)
+#         amplitude = amplitude.float()
+#         amplitude = amplitude.view(amplitude_shape)
         
-        gt = torch.decode_raw(gt_raw, torch.float32)
-        gt = gt.float()
-        gt = gt.view(gt_shape)
+#         gt = torch.decode_raw(gt_raw, torch.float32)
+#         gt = gt.float()
+#         gt = gt.view(gt_shape)
         
-        features = {'noisy': noisy, 'intensity': intensity, 'amplitude': amplitude}
-        labels = {'gt': gt}
+#         features = {'noisy': noisy, 'intensity': intensity, 'amplitude': amplitude}
+#         labels = {'gt': gt}
         
-        return features, labels
+#         return features, labels
     
-    dataset = torch.data.TFRecordDataset(filenames=filenames)
-    dataset = dataset.map(_parse_function)
-    dataset = dataset.map(
-        lambda features, labels: preprocessing_Agresti_S1(features, labels)
-    )
+#     dataset = torch.data.TFRecordDataset(filenames=filenames)
+#     dataset = dataset.map(_parse_function)
+#     dataset = dataset.map(
+#         lambda features, labels: preprocessing_Agresti_S1(features, labels)
+#     )
     
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=256)
+#     if shuffle:
+#         dataset = dataset.shuffle(buffer_size=256)
     
-    dataset = dataset.repeat(repeat_count)
-    batch_dataset = dataset.batch(batch_size)
-    batch_dataset = batch_dataset.prefetch(2)
+#     dataset = dataset.repeat(repeat_count)
+#     batch_dataset = dataset.batch(batch_size)
+#     batch_dataset = batch_dataset.prefetch(2)
     
-    return batch_dataset
+#     return batch_dataset
 
-def imgs_input_fn_RGBDD(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    """Create input function for RGBDD dataset"""
-    def _parse_function(serialized, height=height, width=width):
-        features = {
-            'noisy': torch.FixedLenFeature([], torch.string),
-            'rgb': torch.FixedLenFeature([], torch.string),
-            'gt': torch.FixedLenFeature([], torch.string)
-        }
+# def imgs_input_fn_RGBDD(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     """Create input function for RGBDD dataset"""
+#     def _parse_function(serialized, height=height, width=width):
+#         features = {
+#             'noisy': torch.FixedLenFeature([], torch.string),
+#             'rgb': torch.FixedLenFeature([], torch.string),
+#             'gt': torch.FixedLenFeature([], torch.string)
+#         }
         
-        parsed_example = torch.parse_single_example(serialized=serialized, features=features)
+#         parsed_example = torch.parse_single_example(serialized=serialized, features=features)
         
-        noisy_shape = torch.tensor([144, 192, 1])
-        rgb_shape = torch.tensor([384, 512, 3])
-        gt_shape = torch.tensor([384, 512, 1])
+#         noisy_shape = torch.tensor([144, 192, 1])
+#         rgb_shape = torch.tensor([384, 512, 3])
+#         gt_shape = torch.tensor([384, 512, 1])
         
-        noisy_raw = parsed_example['noisy']
-        rgb_raw = parsed_example['rgb']
-        gt_raw = parsed_example['gt']
+#         noisy_raw = parsed_example['noisy']
+#         rgb_raw = parsed_example['rgb']
+#         gt_raw = parsed_example['gt']
         
-        # Decode the raw bytes
-        noisy = torch.decode_raw(noisy_raw, torch.float32)
-        noisy = noisy.float()
-        noisy = noisy.view(noisy_shape)
+#         # Decode the raw bytes
+#         noisy = torch.decode_raw(noisy_raw, torch.float32)
+#         noisy = noisy.float()
+#         noisy = noisy.view(noisy_shape)
         
-        rgb = torch.decode_raw(rgb_raw, torch.float32)
-        rgb = rgb.float()
-        rgb = rgb.view(rgb_shape)
+#         rgb = torch.decode_raw(rgb_raw, torch.float32)
+#         rgb = rgb.float()
+#         rgb = rgb.view(rgb_shape)
         
-        gt = torch.decode_raw(gt_raw, torch.float32)
-        gt = gt.float()
-        gt = gt.view(gt_shape)
+#         gt = torch.decode_raw(gt_raw, torch.float32)
+#         gt = gt.float()
+#         gt = gt.view(gt_shape)
         
-        features = {'noisy': noisy, 'intensity': rgb, 'rgb': rgb}
-        labels = {'gt': gt}
+#         features = {'noisy': noisy, 'intensity': rgb, 'rgb': rgb}
+#         labels = {'gt': gt}
         
-        return features, labels
+#         return features, labels
     
-    dataset = torch.data.TFRecordDataset(filenames=filenames)
-    dataset = dataset.map(_parse_function)
-    dataset = dataset.map(
-        lambda features, labels: preprocessing_RGBDD(features, labels)
-    )
+#     dataset = torch.data.TFRecordDataset(filenames=filenames)
+#     dataset = dataset.map(_parse_function)
+#     dataset = dataset.map(
+#         lambda features, labels: preprocessing_RGBDD(features, labels)
+#     )
     
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=256)
+#     if shuffle:
+#         dataset = dataset.shuffle(buffer_size=256)
     
-    dataset = dataset.repeat(repeat_count)
-    batch_dataset = dataset.batch(batch_size)
-    batch_dataset = batch_dataset.prefetch(2)
+#     dataset = dataset.repeat(repeat_count)
+#     batch_dataset = dataset.batch(batch_size)
+#     batch_dataset = batch_dataset.prefetch(2)
     
-    return batch_dataset
+#     return batch_dataset
 
-def imgs_input_fn_TB(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    """Create input function for TB dataset"""
-    def _parse_function(serialized, height=height, width=width):
-        features = {
-            'noisy': torch.FixedLenFeature([], torch.string),
-            'intensity': torch.FixedLenFeature([], torch.string),
-            'rgb': torch.FixedLenFeature([], torch.string),
-            'gt': torch.FixedLenFeature([], torch.string)
-        }
+# def imgs_input_fn_TB(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     """Create input function for TB dataset"""
+#     def _parse_function(serialized, height=height, width=width):
+#         features = {
+#             'noisy': torch.FixedLenFeature([], torch.string),
+#             'intensity': torch.FixedLenFeature([], torch.string),
+#             'rgb': torch.FixedLenFeature([], torch.string),
+#             'gt': torch.FixedLenFeature([], torch.string)
+#         }
         
-        parsed_example = torch.parse_single_example(serialized=serialized, features=features)
+#         parsed_example = torch.parse_single_example(serialized=serialized, features=features)
         
-        noisy_shape = torch.tensor([height, width, 1])
-        intensity_shape = torch.tensor([height, width, 1])
-        rgb_shape = torch.tensor([height, width, 1])
-        gt_shape = torch.tensor([height, width, 1])
+#         noisy_shape = torch.tensor([height, width, 1])
+#         intensity_shape = torch.tensor([height, width, 1])
+#         rgb_shape = torch.tensor([height, width, 1])
+#         gt_shape = torch.tensor([height, width, 1])
         
-        noisy_raw = parsed_example['noisy']
-        intensity_raw = parsed_example['intensity']
-        rgb_raw = parsed_example['rgb']
-        gt_raw = parsed_example['gt']
+#         noisy_raw = parsed_example['noisy']
+#         intensity_raw = parsed_example['intensity']
+#         rgb_raw = parsed_example['rgb']
+#         gt_raw = parsed_example['gt']
         
-        # Decode the raw bytes
-        noisy = torch.decode_raw(noisy_raw, torch.float32)
-        noisy = noisy.float()
-        noisy = noisy.view(noisy_shape)
+#         # Decode the raw bytes
+#         noisy = torch.decode_raw(noisy_raw, torch.float32)
+#         noisy = noisy.float()
+#         noisy = noisy.view(noisy_shape)
         
-        intensity = torch.decode_raw(intensity_raw, torch.float32)
-        intensity = intensity.float()
-        intensity = intensity.view(intensity_shape)
+#         intensity = torch.decode_raw(intensity_raw, torch.float32)
+#         intensity = intensity.float()
+#         intensity = intensity.view(intensity_shape)
         
-        rgb = torch.decode_raw(rgb_raw, torch.float32)
-        rgb = rgb.float()
-        rgb = rgb.view(rgb_shape)
+#         rgb = torch.decode_raw(rgb_raw, torch.float32)
+#         rgb = rgb.float()
+#         rgb = rgb.view(rgb_shape)
         
-        gt = torch.decode_raw(gt_raw, torch.float32)
-        gt = gt.float()
-        gt = gt.view(gt_shape)
+#         gt = torch.decode_raw(gt_raw, torch.float32)
+#         gt = gt.float()
+#         gt = gt.view(gt_shape)
         
-        features = {'noisy': noisy, 'intensity': intensity, 'rgb': rgb}
-        labels = {'gt': gt}
+#         features = {'noisy': noisy, 'intensity': intensity, 'rgb': rgb}
+#         labels = {'gt': gt}
         
-        return features, labels
+#         return features, labels
     
-    dataset = torch.data.TFRecordDataset(filenames=filenames)
-    dataset = dataset.map(_parse_function)
-    dataset = dataset.map(
-        lambda features, labels: preprocessing_TB(features, labels)
-    )
+#     dataset = torch.data.TFRecordDataset(filenames=filenames)
+#     dataset = dataset.map(_parse_function)
+#     dataset = dataset.map(
+#         lambda features, labels: preprocessing_TB(features, labels)
+#     )
     
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=256)
+#     if shuffle:
+#         dataset = dataset.shuffle(buffer_size=256)
     
-    dataset = dataset.repeat(repeat_count)
-    batch_dataset = dataset.batch(batch_size)
-    batch_dataset = batch_dataset.prefetch(2)
+#     dataset = dataset.repeat(repeat_count)
+#     batch_dataset = dataset.batch(batch_size)
+#     batch_dataset = batch_dataset.prefetch(2)
     
-    return batch_dataset
+#     return batch_dataset
 
-def imgs_input_fn_TrueBox(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    """Create input function for TrueBox dataset"""
-    def _parse_function(serialized, height=height, width=width):
-        features = {
-            'noisy': torch.FixedLenFeature([], torch.string),
-            'amplitude': torch.FixedLenFeature([], torch.string),
-            'gt': torch.FixedLenFeature([], torch.string)
-        }
+# def imgs_input_fn_TrueBox(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     """Create input function for TrueBox dataset"""
+#     def _parse_function(serialized, height=height, width=width):
+#         features = {
+#             'noisy': torch.FixedLenFeature([], torch.string),
+#             'amplitude': torch.FixedLenFeature([], torch.string),
+#             'gt': torch.FixedLenFeature([], torch.string)
+#         }
         
-        parsed_example = torch.parse_single_example(serialized=serialized, features=features)
+#         parsed_example = torch.parse_single_example(serialized=serialized, features=features)
         
-        noisy_shape = torch.tensor([height, width, 1])
-        amplitude_shape = torch.tensor([height, width, 1])
-        gt_shape = torch.tensor([height, width, 1])
+#         noisy_shape = torch.tensor([height, width, 1])
+#         amplitude_shape = torch.tensor([height, width, 1])
+#         gt_shape = torch.tensor([height, width, 1])
         
-        noisy_raw = parsed_example['noisy']
-        amplitude_raw = parsed_example['amplitude']
-        gt_raw = parsed_example['gt']
+#         noisy_raw = parsed_example['noisy']
+#         amplitude_raw = parsed_example['amplitude']
+#         gt_raw = parsed_example['gt']
         
-        # Decode the raw bytes
-        noisy = torch.decode_raw(noisy_raw, torch.float32)
-        noisy = noisy.float()
-        noisy = noisy.view(noisy_shape)
+#         # Decode the raw bytes
+#         noisy = torch.decode_raw(noisy_raw, torch.float32)
+#         noisy = noisy.float()
+#         noisy = noisy.view(noisy_shape)
         
-        amplitude = torch.decode_raw(amplitude_raw, torch.float32)
-        amplitude = amplitude.float()
-        amplitude = amplitude.view(amplitude_shape)
+#         amplitude = torch.decode_raw(amplitude_raw, torch.float32)
+#         amplitude = amplitude.float()
+#         amplitude = amplitude.view(amplitude_shape)
         
-        gt = torch.decode_raw(gt_raw, torch.float32)
-        gt = gt.float()
-        gt = gt.view(gt_shape)
+#         gt = torch.decode_raw(gt_raw, torch.float32)
+#         gt = gt.float()
+#         gt = gt.view(gt_shape)
         
-        features = {'noisy': noisy, 'amplitude': amplitude}
-        labels = {'gt': gt}
+#         features = {'noisy': noisy, 'amplitude': amplitude}
+#         labels = {'gt': gt}
         
-        return features, labels
+#         return features, labels
     
-    dataset = torch.data.TFRecordDataset(filenames=filenames)
-    dataset = dataset.map(_parse_function)
-    dataset = dataset.map(
-        lambda features, labels: preprocessing_tof_HAMMER(features, labels)
-    )
+#     dataset = torch.data.TFRecordDataset(filenames=filenames)
+#     dataset = dataset.map(_parse_function)
+#     dataset = dataset.map(
+#         lambda features, labels: preprocessing_tof_HAMMER(features, labels)
+#     )
     
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=256)
+#     if shuffle:
+#         dataset = dataset.shuffle(buffer_size=256)
     
-    dataset = dataset.repeat(repeat_count)
-    batch_dataset = dataset.batch(batch_size)
-    batch_dataset = batch_dataset.prefetch(2)
+#     dataset = dataset.repeat(repeat_count)
+#     batch_dataset = dataset.batch(batch_size)
+#     batch_dataset = batch_dataset.prefetch(2)
     
-    return batch_dataset
+#     return batch_dataset
 
-def imgs_input_fn_FLAT(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
-    """Create input function for FLAT dataset"""
-    def _parse_function(serialized, height=height, width=width):
-        features = {
-            'noisy': torch.FixedLenFeature([], torch.string),
-            'amplitude': torch.FixedLenFeature([], torch.string),
-            'gt': torch.FixedLenFeature([], torch.string)
-        }
+# def imgs_input_fn_FLAT(filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
+#     """Create input function for FLAT dataset"""
+#     def _parse_function(serialized, height=height, width=width):
+#         features = {
+#             'noisy': torch.FixedLenFeature([], torch.string),
+#             'amplitude': torch.FixedLenFeature([], torch.string),
+#             'gt': torch.FixedLenFeature([], torch.string)
+#         }
         
-        parsed_example = torch.parse_single_example(serialized=serialized, features=features)
+#         parsed_example = torch.parse_single_example(serialized=serialized, features=features)
         
-        noisy_shape = torch.tensor([height, width, 3])
-        amplitude_shape = torch.tensor([height, width, 3])
-        gt_shape = torch.tensor([height, width, 1])
+#         noisy_shape = torch.tensor([height, width, 3])
+#         amplitude_shape = torch.tensor([height, width, 3])
+#         gt_shape = torch.tensor([height, width, 1])
         
-        noisy_raw = parsed_example['noisy']
-        amplitude_raw = parsed_example['amplitude']
-        gt_raw = parsed_example['gt']
+#         noisy_raw = parsed_example['noisy']
+#         amplitude_raw = parsed_example['amplitude']
+#         gt_raw = parsed_example['gt']
         
-        # Decode the raw bytes
-        noisy = torch.decode_raw(noisy_raw, torch.float32)
-        noisy = noisy.float()
-        noisy = noisy.view(noisy_shape)
+#         # Decode the raw bytes
+#         noisy = torch.decode_raw(noisy_raw, torch.float32)
+#         noisy = noisy.float()
+#         noisy = noisy.view(noisy_shape)
         
-        amplitude = torch.decode_raw(amplitude_raw, torch.float32)
-        amplitude = amplitude.float()
-        amplitude = amplitude.view(amplitude_shape)
+#         amplitude = torch.decode_raw(amplitude_raw, torch.float32)
+#         amplitude = amplitude.float()
+#         amplitude = amplitude.view(amplitude_shape)
         
-        gt = torch.decode_raw(gt_raw, torch.float32)
-        gt = gt.float()
-        gt = gt.view(gt_shape)
+#         gt = torch.decode_raw(gt_raw, torch.float32)
+#         gt = gt.float()
+#         gt = gt.view(gt_shape)
         
-        features = {'noisy': noisy, 'amplitude': amplitude}
-        labels = {'gt': gt}
+#         features = {'noisy': noisy, 'amplitude': amplitude}
+#         labels = {'gt': gt}
         
-        return features, labels
+#         return features, labels
     
-    dataset = torch.data.TFRecordDataset(filenames=filenames)
-    dataset = dataset.map(_parse_function)
-    dataset = dataset.map(
-        lambda features, labels: preprocessing_FLAT(features, labels)
-    )
+#     dataset = torch.data.TFRecordDataset(filenames=filenames)
+#     dataset = dataset.map(_parse_function)
+#     dataset = dataset.map(
+#         lambda features, labels: preprocessing_FLAT(features, labels)
+#     )
     
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=256)
+#     if shuffle:
+#         dataset = dataset.shuffle(buffer_size=256)
     
-    dataset = dataset.repeat(repeat_count)
-    batch_dataset = dataset.batch(batch_size)
-    batch_dataset = batch_dataset.prefetch(2)
+#     dataset = dataset.repeat(repeat_count)
+#     batch_dataset = dataset.batch(batch_size)
+#     batch_dataset = batch_dataset.prefetch(2)
     
-    return batch_dataset
+#     return batch_dataset
 
 ALL_INPUT_FN = {
-    'FLAT': imgs_input_fn_FLAT,
-    'FLAT_reflection_s5': imgs_input_fn_FLAT,
-    'FLAT_full_s5': imgs_input_fn_FLAT,
-    'deeptof_reflection': imgs_input_fn_deeptof,
+    # 'FLAT': imgs_input_fn_FLAT,
+    # 'FLAT_reflection_s5': imgs_input_fn_FLAT,
+    # 'FLAT_full_s5': imgs_input_fn_FLAT,
+    # 'deeptof_reflection': imgs_input_fn_deeptof,
     'tof_FT3': imgs_input_fn_FT3,
-    'tof_FT3D2F': imgs_input_fn_FT3_2F,
-    'tof_FT3D2F_T1': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T3': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T3_F': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T5': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T7': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T9': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T11': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T13': imgs_input_fn_FT3_2F_T3,
-    'tof_FT3D2F_T15': imgs_input_fn_FT3_2F_T3,
-    'RGBDD': imgs_input_fn_RGBDD,
-    'TB': imgs_input_fn_TB,
-    'TrueBox': imgs_input_fn_TrueBox,
-    'cornellbox': imgs_input_fn_cornellbox,
-    'cornellbox_2F': imgs_input_fn_cornellbox_2F,
-    'cornellbox_SN': imgs_input_fn_cornellbox_SN,
-    'cornellbox_SN_F': imgs_input_fn_cornellbox_SN,
-    'Agresti_S1': imgs_input_fn_Agresti_S1,
-    'HAMMER': imgs_input_fn_HAMMER,
-    'HAMMER_A': imgs_input_fn_HAMMER,
-    'HAMMER_A_D': imgs_input_fn_HAMMER,
-    'HAMMER_A_F': imgs_input_fn_HAMMER,
+    # 'tof_FT3D2F': imgs_input_fn_FT3_2F,
+    # 'tof_FT3D2F_T1': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T3': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T3_F': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T5': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T7': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T9': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T11': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T13': imgs_input_fn_FT3_2F_T3,
+    # 'tof_FT3D2F_T15': imgs_input_fn_FT3_2F_T3,
+    # 'RGBDD': imgs_input_fn_RGBDD,
+    # 'TB': imgs_input_fn_TB,
+    # 'TrueBox': imgs_input_fn_TrueBox,
+    # 'cornellbox': imgs_input_fn_cornellbox,
+    # 'cornellbox_2F': imgs_input_fn_cornellbox_2F,
+    # 'cornellbox_SN': imgs_input_fn_cornellbox_SN,
+    # 'cornellbox_SN_F': imgs_input_fn_cornellbox_SN,
+    # 'Agresti_S1': imgs_input_fn_Agresti_S1,
+    # 'HAMMER': imgs_input_fn_HAMMER,
+    # 'HAMMER_A': imgs_input_fn_HAMMER,
+    # 'HAMMER_A_D': imgs_input_fn_HAMMER,
+    # 'HAMMER_A_F': imgs_input_fn_HAMMER,
 }
 
 def get_input_fn(training_set, filenames, height, width, shuffle=False, repeat_count=1, batch_size=32):
