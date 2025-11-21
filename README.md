@@ -24,6 +24,7 @@ https://drive.google.com/drive/folders/1XASaOfcp3TzQJ0A2fMaXex-0eihha0vg
 
 After downloading, please place the dataset under the following directory:
 data/dataset/tof_FT3/
+```
 data/
 └── dataset/
     └── tof_FT3/
@@ -37,7 +38,7 @@ data/
             ├── gt_depth_rgb_test_small_pt/
             ├── nToF/
             └── list.txt
-
+```
 ## Environment Setup
 ```bash
 conda create -n tof_denoising python=3.8 -y
